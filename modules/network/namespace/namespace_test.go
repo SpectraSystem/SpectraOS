@@ -1,16 +1,15 @@
 package namespace
 
 import (
-	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/containernetworking/plugins/pkg/ns"
+
 	"github.com/vishvananda/netlink"
-	"github.com/vishvananda/netns"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,7 +17,7 @@ import (
 
 func TestCreateNetNS(t *testing.T) {
 	name := "testns"
-	_, err := CreateNetNS(name)
+	testNS, err := Create(name)
 	require.NoError(t, err)
 
 	_, err = os.Stat(filepath.Join(netNSPath, name))
@@ -28,7 +27,7 @@ func TestCreateNetNS(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, strings.Contains(string(out), name))
 
-	err = DeleteNetNS(name)
+	err = Delete(testNS)
 	require.NoError(t, err)
 
 	out, err = exec.Command("ip", "netns").CombinedOutput()
@@ -36,57 +35,34 @@ func TestCreateNetNS(t *testing.T) {
 	assert.False(t, strings.Contains(string(out), name))
 }
 
-func TestSetLinkNS(t *testing.T) {
-	link := &netlink.Dummy{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: "dummy0",
-		},
-	}
-	err := netlink.LinkAdd(link)
-	require.NoError(t, err)
-	defer netlink.LinkDel(link)
-
-	_, err = CreateNetNS("testns")
-	require.NoError(t, err)
-	defer DeleteNetNS("testns")
-
-	err = SetLinkNS(link, "testns")
-	assert.NoError(t, err)
-}
-
-func printIfaces(ifaces []netlink.Link) {
-	for _, iface := range ifaces {
-		fmt.Println(iface.Attrs().Name)
-	}
-}
-func TestNamespace(t *testing.T) {
+func TestNamespaceIsolation(t *testing.T) {
 	ifaces, err := netlink.LinkList()
+	require.NoError(t, err)
 	ifacesNr := len(ifaces)
 	assert.True(t, ifacesNr > 0)
 
 	nsName := "testns"
-	_, err = CreateNetNS(nsName)
+	netns, err := Create(nsName)
 	require.NoError(t, err)
-	defer DeleteNetNS(nsName)
+	defer Delete(netns)
 
-	nsCtx := NSContext{}
-	err = nsCtx.Enter(nsName)
-	require.NoError(t, err)
+	err = netns.Do(func(_ ns.NetNS) error {
+		ifaces, err = netlink.LinkList()
+		require.NoError(t, err)
+		assert.True(t, len(ifaces) == 1)
 
-	ifaces, err = netlink.LinkList()
-	assert.True(t, len(ifaces) == 1)
+		err = netlink.LinkAdd(&netlink.Dummy{
+			LinkAttrs: netlink.LinkAttrs{
+				Name: "dummy1",
+			},
+		})
+		require.NoError(t, err)
 
-	err = netlink.LinkAdd(&netlink.Dummy{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: "dummy1",
-		},
+		ifaces, err = netlink.LinkList()
+		require.NoError(t, err)
+		assert.True(t, len(ifaces) == 2)
+		return nil
 	})
-	require.NoError(t, err)
-
-	ifaces, err = netlink.LinkList()
-	assert.True(t, len(ifaces) == 2)
-
-	err = nsCtx.Exit()
 	require.NoError(t, err)
 
 	ifaces, err = netlink.LinkList()
@@ -101,64 +77,3 @@ func TestNamespace(t *testing.T) {
 	assert.Equal(t, ifacesNr, len(ifaces))
 	assert.False(t, found)
 }
-
-func TestNSContext(t *testing.T) {
-	nsName := "testns"
-
-	origin, err := netns.Get()
-	require.NoError(t, err)
-
-	_, err = CreateNetNS(nsName)
-	require.NoError(t, err)
-	defer DeleteNetNS(nsName)
-
-	nsCtx := NSContext{}
-	err = nsCtx.Enter(nsName)
-	require.NoError(t, err)
-
-	current, err := netns.Get()
-	require.NoError(t, err)
-
-	assert.True(t, nsCtx.origins.Equal(origin))
-	assert.True(t, nsCtx.working.Equal(current))
-
-	err = nsCtx.Exit()
-	require.NoError(t, err)
-
-	current, _ = netns.Get()
-	assert.True(t, origin.Equal(current))
-}
-
-func TestAddRoute(t *testing.T) {
-	nsName := "testns"
-	_, err := CreateNetNS(nsName)
-	require.NoError(t, err)
-	defer DeleteNetNS(nsName)
-
-	ns, err := netns.GetFromName(nsName)
-	require.NoError(t, err)
-
-	h, err := netlink.NewHandleAt(ns)
-	require.NoError(t, err)
-	err = h.RouteAdd(&netlink.Route{
-		Src: net.ParseIP("172.21.0.10"),
-		Gw:  net.ParseIP("172.21.0.1"),
-	})
-	require.NoError(t, err)
-}
-
-// func TestCreateNetNSMultiple(t *testing.T) {
-// 	name := "testns"
-// 	_, err := CreateNetNS(name)
-// 	require.NoError(t, err)
-
-// 	name2 := "testns2"
-// 	_, err = CreateNetNS(name2)
-// 	require.NoError(t, err)
-
-// 	err = DeleteNetNS(name)
-// 	require.NoError(t, err)
-
-// 	err = DeleteNetNS(name2)
-// 	require.NoError(t, err)
-// }
