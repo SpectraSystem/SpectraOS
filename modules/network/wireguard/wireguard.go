@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 
 	"github.com/vishvananda/netlink"
@@ -93,7 +94,7 @@ type Peer struct {
 }
 
 // Configure configures the wiregard configuration
-func (w *Wireguard) Configure(privateKey string, peers []Peer) error {
+func (w *Wireguard) Configure(privateKey string, listentPort int, peers []Peer) error {
 
 	if err := netlink.LinkSetDown(w); err != nil {
 		return err
@@ -119,18 +120,26 @@ func (w *Wireguard) Configure(privateKey string, peers []Peer) error {
 		return err
 	}
 
+	for _, peer := range peersConfig {
+		fmt.Printf("%+v\n", peer)
+	}
+
 	config := wgtypes.Config{
 		PrivateKey:   &key,
 		Peers:        peersConfig,
+		ListenPort:   &listentPort,
 		ReplacePeers: true,
 	}
 	log.Info().Msg("configure wg device")
 
 	if err := wc.ConfigureDevice(w.attrs.Name, config); err != nil {
-		return err
+		return errors.Wrap(err, "failed to configure wireguard interface")
 	}
 
-	return netlink.LinkSetUp(w)
+	if err := netlink.LinkSetUp(w); err != nil {
+		return errors.Wrapf(err, "failed to bring wireguard interface %s up", w.Attrs().Name)
+	}
+	return nil
 }
 
 func newPeer(pubkey, endpoint string, allowedIPs []string) (wgtypes.PeerConfig, error) {
@@ -170,15 +179,25 @@ func newPeer(pubkey, endpoint string, allowedIPs []string) (wgtypes.PeerConfig, 
 			return peer, err
 		}
 		ipNet.IP = ip
-		fmt.Printf("allowed ips %+v\n", ipNet)
 		peer.AllowedIPs = append(peer.AllowedIPs, *ipNet)
 	}
 
 	return peer, nil
 }
 
-// GenerateKey generates a new private key
+// GenerateKey generates a new private key. If key already exists
+// in that location, that key is returned instead.
 func GenerateKey(dir string) (wgtypes.Key, error) {
+	path := filepath.Join(dir, "key.priv")
+	data, err := ioutil.ReadFile(path)
+	if err == nil {
+		//key already exists
+		return wgtypes.ParseKey(string(data))
+	} else if !os.IsNotExist(err) {
+		//another error than not exist
+		return wgtypes.Key{}, err
+	}
+
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		return wgtypes.Key{}, err
@@ -187,7 +206,6 @@ func GenerateKey(dir string) (wgtypes.Key, error) {
 		return wgtypes.Key{}, err
 	}
 
-	path := filepath.Join(dir, "key.priv")
 	if err := ioutil.WriteFile(path, []byte(key.String()), 400); err != nil {
 		return wgtypes.Key{}, err
 	}

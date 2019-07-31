@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"flag"
+	"os"
+
+	"github.com/rs/zerolog"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zosv2/modules/storage"
+	"github.com/threefoldtech/zosv2/modules/version"
 )
 
 const (
@@ -19,14 +23,24 @@ func main() {
 	var (
 		msgBrokerCon string
 		workerNr     uint
+		ver          bool
 	)
 
 	flag.StringVar(&msgBrokerCon, "broker", redisSocket, "Connection string to the message broker")
 	flag.UintVar(&workerNr, "workers", 1, "Number of workers")
+	flag.BoolVar(&ver, "v", false, "show version and exit")
 
 	flag.Parse()
+	if ver {
+		version.ShowAndExit(false)
+	}
 
-	storage := storage.New()
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
+	storage, err := storage.New()
+	if err != nil {
+		log.Fatal().Msgf("Error initializing storage module: %s", err)
+	}
 
 	server, err := zbus.NewRedisServer(module, msgBrokerCon, workerNr)
 	if err != nil {

@@ -3,7 +3,6 @@ package namespace
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -11,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -27,7 +27,7 @@ func Create(name string) (ns.NetNS, error) {
 	// other namespaces (containers)
 	err := os.MkdirAll(netNSPath, 0755)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to create network namespace directory %s", netNSPath)
 	}
 
 	// Remount the namespace directory shared. This will fail if it is not
@@ -58,7 +58,7 @@ func Create(name string) (ns.NetNS, error) {
 	nsPath := path.Join(netNSPath, name)
 	mountPointFd, err := os.Create(nsPath)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to create file %s", nsPath)
 	}
 	mountPointFd.Close()
 
@@ -128,13 +128,6 @@ func Delete(ns ns.NetNS) error {
 	// Only unmount if it's been bind-mounted (don't touch namespaces in /proc...)
 	if strings.HasPrefix(nsPath, netNSPath) {
 		if err := unix.Unmount(nsPath, 0); err != nil {
-
-			out, cmdErr := exec.Command("bash", "-c", "lsof | grep net-ff02").CombinedOutput()
-			if cmdErr != nil {
-				panic(cmdErr)
-			}
-			fmt.Println(string(out))
-
 			return fmt.Errorf("failed to unmount NS: at %s: %v", nsPath, err)
 		}
 
