@@ -75,7 +75,7 @@ func (s *storageModule) initialize(policy modules.StoragePolicy) error {
 	// remount all existing pools
 	log.Info().Msgf("Remounting existing volumes")
 	log.Debug().Msgf("Searching for existing volumes")
-	existingPools, err := fs.List(ctx)
+	existingPools, err := fs.List(ctx, filesystem.All)
 	if err != nil {
 		return err
 	}
@@ -303,9 +303,19 @@ func (s *storageModule) createSubvol(size uint64, name string, poolType modules.
 			continue
 		}
 
+		reserved, err := s.volumes[idx].Reserved()
+		if err != nil {
+			log.Error().Err(err).Msgf("failed to get size of pool %s", s.volumes[idx].Name())
+		}
+
+		log.Debug().
+			Uint64("max size", usage.Size).
+			Uint64("reserved", reserved).
+			Uint64("new size", reserved+size).
+			Msgf("usage of pool %s", s.volumes[idx].Name())
 		// Make sure adding this filesystem would not bring us over the disk limit
-		if usage.Used+size > usage.Size {
-			log.Info().Msgf("Disk does not have enough space left to hold filesytem")
+		if reserved+size > usage.Size {
+			log.Info().Msgf("Disk does not have enough space left to hold filesystem")
 			continue
 		}
 

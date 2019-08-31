@@ -1,1 +1,7 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/8a1544963fa44aeac4253204f5652237
+module github.com/threefoldtech/zosv2/cmds/schemac
+
+go 1.12
+
+replace github.com/threefoldtech/zosv2/modules => ../../modules/
+
+require github.com/threefoldtech/zosv2/modules v0.0.0-00010101000000-000000000000

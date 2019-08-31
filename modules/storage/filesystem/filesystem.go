@@ -48,8 +48,18 @@ type Pool interface {
 	RemoveDevice(device *Device) error
 	// Type of the physical storage in this pool
 	Type() modules.DeviceType
+	// Reserved is reserved size of the devices in bytes
+	Reserved() (uint64, error)
 
 	// Health() ?
+}
+
+// Filter closure for Filesystem list
+type Filter func(pool Pool) bool
+
+// All is default filter
+func All(Pool) bool {
+	return true
 }
 
 // Filesystem defines a filesystem interface
@@ -61,5 +71,5 @@ type Filesystem interface {
 	// profile: Raid profile of the filesystem
 	Create(ctx context.Context, name string, devices DeviceCache, profile modules.RaidProfile) (Pool, error)
 	// List all existing filesystems on the node
-	List(ctx context.Context) ([]Pool, error)
+	List(ctx context.Context, filter Filter) ([]Pool, error)
 }

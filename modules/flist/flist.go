@@ -26,7 +26,7 @@ const (
 	defaultRoot    = "/var/cache/modules/flist"
 )
 
-const MiB = 1024 * 1024
+const mib = 1024 * 1024
 
 type flistModule struct {
 	// root directory where all
@@ -41,11 +41,11 @@ type flistModule struct {
 	pid        string
 	log        string
 
-	storage modules.StorageModule
+	storage modules.VolumeAllocater
 }
 
 // New creates a new flistModule
-func New(root string, storage modules.StorageModule) modules.Flister {
+func New(root string, storage modules.VolumeAllocater) modules.Flister {
 	if root == "" {
 		root = defaultRoot
 	}
@@ -94,7 +94,7 @@ func (f *flistModule) Mount(url, storage string) (string, error) {
 		return "", err
 	}
 
-	path, err := f.storage.CreateFilesystem(rnd, 256*MiB, modules.SSDDevice)
+	path, err := f.storage.CreateFilesystem(rnd, 256*mib, modules.SSDDevice)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create read-write subvolume for 0-fs")
 	}
@@ -107,7 +107,7 @@ func (f *flistModule) Mount(url, storage string) (string, error) {
 	logPath := filepath.Join(f.log, rnd) + ".log"
 
 	args := []string{
-		"-backend", filepath.Join(path, "backend"),
+		"-backend", path,
 		"-cache", f.cache,
 		"-meta", flistPath,
 		"-storage-url", storage,
