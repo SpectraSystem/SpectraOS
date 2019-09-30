@@ -7,24 +7,20 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"time"
 
 	"github.com/pkg/errors"
 	"github.com/threefoldtech/zosv2/modules"
 	"github.com/threefoldtech/zosv2/modules/network"
 
-	"github.com/rs/zerolog/log"
-
-	"github.com/threefoldtech/zosv2/modules/network/ifaceutil"
-	"github.com/vishvananda/netlink"
+	"github.com/threefoldtech/zosv2/modules/network/types"
 )
 
 type httpTNoDB struct {
 	baseURL string
 }
 
-// NewHTTPHTTPTNoDB create an a client to a TNoDB reachable over HTTP
-func NewHTTPHTTPTNoDB(url string) network.TNoDB {
+// NewHTTPTNoDB create an a client to a TNoDB reachable over HTTP
+func NewHTTPTNoDB(url string) network.TNoDBUtils {
 	return &httpTNoDB{baseURL: url}
 }
 
@@ -60,11 +56,11 @@ func (s *httpTNoDB) RegisterAllocation(farm modules.Identifier, allocation *net.
 	return nil
 }
 
-func (s *httpTNoDB) RequestAllocation(farm modules.Identifier) (*net.IPNet, *net.IPNet, error) {
+func (s *httpTNoDB) RequestAllocation(farm modules.Identifier) (*net.IPNet, *net.IPNet, uint8, error) {
 	url := fmt.Sprintf("%s/%s/%s", s.baseURL, "allocations", farm.Identity())
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
 
@@ -74,45 +70,46 @@ func (s *httpTNoDB) RequestAllocation(farm modules.Identifier) (*net.IPNet, *net
 			panic(err)
 		}
 		fmt.Printf("%+v", string(b))
-		return nil, nil, fmt.Errorf("wrong response status code received: %v", resp.Status)
+		return nil, nil, 0, fmt.Errorf("wrong response status code received: %v", resp.Status)
 	}
 
 	data := struct {
-		Alloc     string `json:"allocation"`
-		FarmAlloc string `json:"farm_allocation"`
+		Alloc      string `json:"allocation"`
+		FarmAlloc  string `json:"farm_alloc"`
+		ExitNodeNr uint8  `json:"exit_node_nr"`
 	}{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	_, alloc, err := net.ParseCIDR(data.Alloc)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to parse network allocation")
+		return nil, nil, 0, errors.Wrap(err, "failed to parse network allocation")
 	}
 	_, farmAlloc, err := net.ParseCIDR(data.FarmAlloc)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to parse farm allocation")
+		return nil, nil, 0, errors.Wrap(err, "failed to parse farm allocation")
 	}
 
-	return alloc, farmAlloc, nil
+	return alloc, farmAlloc, data.ExitNodeNr, nil
 }
 
-func (s *httpTNoDB) GetFarm(farm modules.Identifier) (network.Farm, error) {
-	f := network.Farm{}
+func (s *httpTNoDB) GetFarm(farm modules.Identifier) (*network.Farm, error) {
+	var f network.Farm
 
 	url := fmt.Sprintf("%s/farms/%s", s.baseURL, farm.Identity())
 	resp, err := http.Get(url)
 	if err != nil {
-		return f, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	err = json.NewDecoder(resp.Body).Decode(&f)
 
-	return f, err
+	return &f, err
 }
 
-func (s *httpTNoDB) GetNode(nodeID modules.Identifier) (*network.Node, error) {
+func (s *httpTNoDB) GetNode(nodeID modules.Identifier) (*types.Node, error) {
 
 	url := fmt.Sprintf("%s/nodes/%s", s.baseURL, nodeID.Identity())
 
@@ -130,7 +127,7 @@ func (s *httpTNoDB) GetNode(nodeID modules.Identifier) (*network.Node, error) {
 		return nil, fmt.Errorf("wrong response status: %v", resp.Status)
 	}
 
-	node := &network.Node{}
+	node := &types.Node{}
 	if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
 		return nil, err
 	}
@@ -138,56 +135,10 @@ func (s *httpTNoDB) GetNode(nodeID modules.Identifier) (*network.Node, error) {
 	return node, nil
 }
 
-func (s *httpTNoDB) PublishInterfaces(local modules.Identifier) error {
-	output := []*network.IfaceInfo{}
-
-	links, err := netlink.LinkList()
-	if err != nil {
-		log.Error().Err(err).Msgf("failed to list interfaces")
-		return err
-	}
-
-	for _, link := range ifaceutil.LinkFilter(links, []string{"device", "bridge"}) {
-
-		// TODO: see if we need to set the if down
-		if err := netlink.LinkSetUp(link); err != nil {
-			log.Info().Str("interface", link.Attrs().Name).Msg("failed to bring interface up")
-			continue
-		}
-
-		if !ifaceutil.IsVirtEth(link.Attrs().Name) && !ifaceutil.IsPluggedTimeout(link.Attrs().Name, time.Second*5) {
-			log.Info().Str("interface", link.Attrs().Name).Msg("interface is not plugged in, skipping")
-			continue
-		}
-
-		_, gw, err := ifaceutil.HasDefaultGW(link)
-		if err != nil {
-			return err
-		}
-
-		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return err
-		}
-
-		info := &network.IfaceInfo{
-			Name:  link.Attrs().Name,
-			Addrs: make([]*net.IPNet, len(addrs)),
-		}
-		for i, addr := range addrs {
-			info.Addrs[i] = addr.IPNet
-		}
-
-		if gw != nil {
-			info.Gateway = append(info.Gateway, gw)
-		}
-
-		output = append(output, info)
-	}
-
+func (s *httpTNoDB) PublishInterfaces(local modules.Identifier, ifaces []types.IfaceInfo) error {
 	url := fmt.Sprintf("%s/nodes/%s/interfaces", s.baseURL, local.Identity())
 	buf := &bytes.Buffer{}
-	if err := json.NewEncoder(buf).Encode(output); err != nil {
+	if err := json.NewEncoder(buf).Encode(ifaces); err != nil {
 		return err
 	}
 
@@ -204,28 +155,37 @@ func (s *httpTNoDB) PublishInterfaces(local modules.Identifier) error {
 	return nil
 }
 
-func (s *httpTNoDB) ConfigurePublicIface(node modules.Identifier, ips []*net.IPNet, gws []net.IP, iface string) error {
+func (s *httpTNoDB) PublishWGPort(nodeID modules.Identifier, ports []uint) error {
+	url := fmt.Sprintf("%s/nodes/%s/ports", s.baseURL, nodeID.Identity())
+
 	output := struct {
-		Iface string            `json:"iface"`
-		IPs   []string          `json:"ips"`
-		GWs   []string          `json:"gateways"`
-		Type  network.IfaceType `json:"iface_type"`
+		Ports []uint `json:"ports"`
 	}{
-		Iface: iface,
-		IPs:   make([]string, len(ips)),
-		GWs:   make([]string, len(gws)),
-		Type:  network.MacVlanIface, //TODO: allow to chose type of connection
+		Ports: ports,
+	}
+	buf := &bytes.Buffer{}
+	if err := json.NewEncoder(buf).Encode(output); err != nil {
+		return err
 	}
 
-	for i := range ips {
-		output.IPs[i] = ips[i].String()
-		output.GWs[i] = gws[i].String()
+	resp, err := http.Post(url, "application/json", buf)
+	if err != nil {
+		return err
 	}
 
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("wrong response status received: %s", resp.Status)
+	}
+
+	return nil
+}
+
+func (s *httpTNoDB) SetPublicIface(node modules.Identifier, pub *types.PubIface) error {
 	url := fmt.Sprintf("%s/nodes/%s/configure_public", s.baseURL, node.Identity())
 
 	buf := &bytes.Buffer{}
-	if err := json.NewEncoder(buf).Encode(output); err != nil {
+	if err := json.NewEncoder(buf).Encode(pub); err != nil {
 		return err
 	}
 
@@ -255,10 +215,10 @@ func (s *httpTNoDB) SelectExitNode(node modules.Identifier) error {
 	return nil
 }
 
-func (s *httpTNoDB) ReadPubIface(node modules.Identifier) (*network.PubIface, error) {
+func (s *httpTNoDB) GetPubIface(node modules.Identifier) (*types.PubIface, error) {
 
 	iface := &struct {
-		PublicConfig *network.PubIface `json:"public_config"`
+		PublicConfig *types.PubIface `json:"public_config"`
 	}{}
 
 	url := fmt.Sprintf("%s/nodes/%s", s.baseURL, node.Identity())

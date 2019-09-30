@@ -5,20 +5,28 @@ import (
 	"net"
 
 	"github.com/threefoldtech/zosv2/modules"
+	"github.com/threefoldtech/zosv2/modules/network/types"
 )
 
 // TNoDB define the interface to implement
 // to talk to a Tenant Network object database
 type TNoDB interface {
+	GetFarm(farm modules.Identifier) (*Farm, error)
+
+	PublishInterfaces(node modules.Identifier, ifaces []types.IfaceInfo) error
+	GetNode(modules.Identifier) (*types.Node, error)
+	PublishWGPort(node modules.Identifier, ports []uint) error
+
+	SetPublicIface(node modules.Identifier, pub *types.PubIface) error
+	GetPubIface(node modules.Identifier) (*types.PubIface, error)
+}
+
+// TNoDBUtils define the interface to implement
+// to talk to a Tenant Network object database including utils methods
+type TNoDBUtils interface {
+	TNoDB
 	RegisterAllocation(farm modules.Identifier, allocation *net.IPNet) error
-	RequestAllocation(farm modules.Identifier) (*net.IPNet, *net.IPNet, error)
-	GetFarm(farm modules.Identifier) (Farm, error)
-
-	PublishInterfaces(node modules.Identifier) error
-	GetNode(modules.Identifier) (*Node, error)
-
-	ConfigurePublicIface(node modules.Identifier, ips []*net.IPNet, gws []net.IP, iface string) error
-	ReadPubIface(node modules.Identifier) (*PubIface, error)
+	RequestAllocation(farm modules.Identifier) (*net.IPNet, *net.IPNet, uint8, error)
 
 	SelectExitNode(node modules.Identifier) error
 

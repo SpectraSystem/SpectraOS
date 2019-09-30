@@ -17,7 +17,7 @@ import (
 
 var (
 	idStore identity.IDStore
-	db      network.TNoDB
+	db      network.TNoDBUtils
 )
 
 func main() {
@@ -48,7 +48,7 @@ func main() {
 
 		url := c.String("tnodb")
 		idStore = identity.NewHTTPIDStore(url)
-		db = tnodb.NewHTTPHTTPTNoDB(url)
+		db = tnodb.NewHTTPTNoDB(url)
 
 		return nil
 	}
@@ -90,13 +90,6 @@ func main() {
 					Action: giveAlloc,
 				},
 				{
-					Name:      "get-alloc",
-					Category:  "network",
-					Usage:     "get an allocation for a tenant network",
-					ArgsUsage: "farm_id",
-					Action:    getAlloc,
-				},
-				{
 					Name:     "configure-public",
 					Category: "network",
 					Usage: `configure the public interface of a node.
@@ -133,12 +126,6 @@ You can specify multime time the ip and gw flag to configure multiple IP on the 
 	if err != nil {
 		log.Fatal().Msg(err.Error())
 	}
-}
-
-type strID string
-
-func (f strID) Identity() string {
-	return string(f)
 }
 
 func loadFarmID(seedPath string) (modules.Identifier, error) {

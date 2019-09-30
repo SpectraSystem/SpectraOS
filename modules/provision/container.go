@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path"
 
@@ -16,7 +17,9 @@ import (
 
 // Network struct
 type Network struct {
-	NetwokID string `json:"network_id"`
+	NetwokID modules.NetID `json:"network_id"`
+	// IP to give to the container
+	IPs []net.IP `json:"ips"`
 }
 
 // Mount defines a container volume mounted inside the container
@@ -30,7 +33,7 @@ type Container struct {
 	// URL of the flist
 	FList string `json:"flist"`
 	// URL of the storage backend for the flist
-	FlistStorage string `json:"flist"`
+	FlistStorage string `json:"flist_storage"`
 	// Env env variables to container in format
 	Env map[string]string `json:"env"`
 	// Entrypoint the process to start inside the container
@@ -41,6 +44,14 @@ type Container struct {
 	Mounts []Mount `json:"mounts"`
 	// Network network info for container
 	Network Network `json:"network"`
+}
+
+// ContainerResult is the information return to the BCDB
+// after deploying a container
+type ContainerResult struct {
+	ID   string `json:"id"`
+	IPv6 string `json:"ipv6"`
+	IPv4 string `json:"ipv4"`
 }
 
 // ContainerProvision is entry point to container reservation
@@ -72,18 +83,28 @@ func containerProvision(ctx context.Context, reservation *Reservation) (interfac
 	}
 
 	log.Debug().
-		Str("network-id", config.Network.NetwokID).
+		Str("network-id", string(config.Network.NetwokID)).
 		Str("config", fmt.Sprintf("%+v", config)).
 		Msg("deploying network")
 
 	networkMgr := stubs.NewNetworkerStub(GetZBus(ctx))
-	join, err := networkMgr.Join(reservation.ID, modules.NetID(config.Network.NetwokID))
+
+	ips := make([]string, len(config.Network.IPs))
+	for i, ip := range config.Network.IPs {
+		ips[i] = ip.String()
+	}
+
+	join, err := networkMgr.Join(modules.NetID(config.Network.NetwokID), containerID, ips)
 	if err != nil {
 		return nil, err
 	}
 
 	// TODO: Push IP back to bcdb
-	log.Info().Str("ip", join.IP.String()).Str("container", reservation.ID).Msg("assigned an IP")
+	log.Info().
+		Str("ipv6", join.IPv6.String()).
+		Str("ipv4", join.IPv4.String()).
+		Str("container", reservation.ID).
+		Msg("assigned an IP")
 
 	log.Debug().Str("flist", config.FList).Msg("mounting flist")
 	mnt, err := flistClient.Mount(config.FList, config.FlistStorage)
@@ -154,7 +175,11 @@ func containerProvision(ctx context.Context, reservation *Reservation) (interfac
 	}
 
 	log.Info().Msgf("container created with id: '%s'", id)
-	return id, nil
+	return ContainerResult{
+		ID:   string(id),
+		IPv6: join.IPv6.String(),
+		IPv4: join.IPv4.String(),
+	}, nil
 }
 
 func containerDecommission(ctx context.Context, reservation *Reservation) error {

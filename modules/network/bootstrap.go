@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/threefoldtech/zosv2/modules/network/dhcp"
+
 	"github.com/containernetworking/plugins/pkg/utils/sysctl"
 	"github.com/pkg/errors"
-
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zosv2/modules/network/bridge"
 	"github.com/threefoldtech/zosv2/modules/network/ifaceutil"
-
 	"github.com/vishvananda/netlink"
 )
 
@@ -31,7 +31,7 @@ func Bootstrap() error {
 		return err
 	}
 
-	if _, err := sysctl.Sysctl(fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", DefaultBridge), "1"); err != nil {
+	if _, err := sysctl.Sysctl(fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", DefaultBridge), "0"); err != nil {
 		return errors.Wrapf(err, "failed to disable ip6 on bridge %s", DefaultBridge)
 	}
 
@@ -54,7 +54,18 @@ func Bootstrap() error {
 			continue
 		}
 
-		// TODO: see if we need to set the if down
+		if addresses, err := netlink.AddrList(device, netlink.FAMILY_ALL); err == nil {
+			for _, address := range addresses {
+				if err := netlink.AddrDel(device, &address); err != nil {
+					log.Error().
+						Err(err).
+						Str("address", address.String()).
+						Str("interface", device.Name).
+						Msg("failed to remove assigned address")
+				}
+			}
+		}
+
 		if err := netlink.LinkSetUp(device); err != nil {
 			log.Info().Str("interface", device.Name).Msg("failed to bring interface up")
 			continue
@@ -75,7 +86,7 @@ func Bootstrap() error {
 		}
 
 		log.Info().Str("interface", device.Name).Msg("start dhcp probing")
-		valid, err := dhcpProbe(br.Name)
+		valid, err := dhcp.Probe(br.Name)
 		if err != nil {
 			log.Warn().Err(err).Str("device", device.Name).Msg("dhcp probing unexpected error")
 			if err := bridge.DetachNic(br); err != nil {
@@ -101,5 +112,19 @@ func Bootstrap() error {
 	}
 
 	log.Info().Str("device", defaultGW.Name).Msg("default gateway found")
+	return nil
+}
+
+// DefaultBridgeValid validates default bridge exists and of correct type
+func DefaultBridgeValid() error {
+	link, err := netlink.LinkByName(DefaultBridge)
+	if err != nil {
+		return err
+	}
+
+	if link.Type() != "bridge" {
+		return fmt.Errorf("invalid default bridge type (%s) expecting (bridge)", link.Type())
+	}
+
 	return nil
 }
