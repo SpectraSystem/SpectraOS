@@ -1,1 +1,129 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/51cff5f77bf1d02faac73ed716201339
+package main
+
+import (
+	"flag"
+	"os"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/cenkalti/backoff/v3"
+
+	"github.com/pkg/errors"
+	"github.com/threefoldtech/zos/pkg/capacity"
+	"github.com/threefoldtech/zos/pkg/environment"
+	"github.com/threefoldtech/zos/pkg/gedis"
+	"github.com/threefoldtech/zos/pkg/stubs"
+
+	"github.com/rs/zerolog/log"
+
+	"github.com/threefoldtech/zbus"
+	"github.com/threefoldtech/zos/pkg/version"
+)
+
+const module = "capacity"
+
+func main() {
+	var (
+		msgBrokerCon string
+		ver          bool
+	)
+
+	flag.StringVar(&msgBrokerCon, "broker", "unix:///var/run/redis.sock", "connection string to the message broker")
+	flag.BoolVar(&ver, "v", false, "show version and exit")
+
+	flag.Parse()
+	if ver {
+		version.ShowAndExit(false)
+	}
+
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
+	redis, err := zbus.NewRedisClient(msgBrokerCon)
+	if err != nil {
+		log.Fatal().Msgf("fail to connect to message broker server: %v", err)
+	}
+	storage := stubs.NewStorageModuleStub(redis)
+	identity := stubs.NewIdentityManagerStub(redis)
+	store, err := bcdbClient()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to connect to bcdb backend")
+	}
+
+	r := capacity.NewResourceOracle(storage)
+
+	log.Info().Msg("inspect hardware resources")
+	resources, err := r.Total()
+	if err != nil {
+		log.Fatal().Err(err).Msgf("failed to read resources capacity from hardware")
+	}
+	log.Info().
+		Uint64("CRU", resources.CRU).
+		Uint64("MRU", resources.MRU).
+		Uint64("SRU", resources.SRU).
+		Uint64("HRU", resources.HRU).
+		Msg("resource units found")
+
+	log.Info().Msg("read DMI info")
+	dmi, err := r.DMI()
+	if err != nil {
+		log.Fatal().Err(err).Msgf("failed to read DMI information from hardware")
+	}
+
+	disks, err := r.Disks()
+	if err != nil {
+		log.Fatal().Err(err).Msgf("failed to read smartctl information from disks")
+	}
+
+	log.Info().Msg("sends capacity detail to BCDB")
+	if err := store.Register(identity.NodeID(), *resources, *dmi, disks); err != nil {
+		log.Fatal().Err(err).Msgf("failed to write resources capacity on BCDB")
+	}
+
+	sendUptime := func() error {
+		uptime, err := r.Uptime()
+		if err != nil {
+			log.Error().Err(err).Msgf("failed to read uptime")
+			return err
+		}
+
+		log.Info().Msg("send heart-beat to BCDB")
+		if err := store.Ping(identity.NodeID(), uptime); err != nil {
+			log.Error().Err(err).Msgf("failed to send heart-beat to BCDB")
+			return err
+		}
+		return nil
+	}
+	if err := sendUptime(); err != nil {
+		log.Fatal().Err(err).Send()
+	}
+
+	for {
+		next := time.Now().Add(time.Minute * 10)
+
+		if time.Now().After(next) {
+			backoff.Retry(sendUptime, backoff.NewExponentialBackOff())
+			continue
+		}
+
+		time.Sleep(time.Minute)
+	}
+}
+
+// instantiate the proper client based on the running mode
+func bcdbClient() (capacity.Store, error) {
+	env := environment.Get()
+
+	// use the bcdb mock for dev and test
+	if env.RunningMode == environment.RunningDev {
+		return capacity.NewHTTPStore(env.BcdbURL), nil
+	}
+
+	// use gedis for production bcdb
+	store, err := gedis.New(env.BcdbURL, env.BcdbNamespace, env.BcdbPassword)
+	if err != nil {
+		return nil, errors.Wrap(err, "fail to connect to BCDB")
+	}
+
+	return capacity.NewBCDBStore(store), nil
+}

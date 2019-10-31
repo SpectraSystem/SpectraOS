@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"net"
 	"os"
 	"time"
 
@@ -12,17 +11,17 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zbus"
-	"github.com/threefoldtech/zosv2/modules"
-	"github.com/threefoldtech/zosv2/modules/environment"
-	"github.com/threefoldtech/zosv2/modules/gedis"
-	"github.com/threefoldtech/zosv2/modules/network"
-	"github.com/threefoldtech/zosv2/modules/network/ifaceutil"
-	"github.com/threefoldtech/zosv2/modules/network/ndmz"
-	"github.com/threefoldtech/zosv2/modules/network/tnodb"
-	"github.com/threefoldtech/zosv2/modules/network/types"
-	"github.com/threefoldtech/zosv2/modules/stubs"
-	"github.com/threefoldtech/zosv2/modules/utils"
-	"github.com/threefoldtech/zosv2/modules/version"
+	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/environment"
+	"github.com/threefoldtech/zos/pkg/gedis"
+	"github.com/threefoldtech/zos/pkg/network"
+	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
+	"github.com/threefoldtech/zos/pkg/network/ndmz"
+	"github.com/threefoldtech/zos/pkg/network/tnodb"
+	"github.com/threefoldtech/zos/pkg/network/types"
+	"github.com/threefoldtech/zos/pkg/stubs"
+	"github.com/threefoldtech/zos/pkg/utils"
+	"github.com/threefoldtech/zos/pkg/version"
 	"github.com/vishvananda/netlink"
 )
 
@@ -141,10 +140,10 @@ func getLocalInterfaces() ([]types.IfaceInfo, error) {
 
 		info := types.IfaceInfo{
 			Name:  link.Attrs().Name,
-			Addrs: make([]*net.IPNet, len(addrs)),
+			Addrs: make([]types.IPNet, len(addrs)),
 		}
 		for i, addr := range addrs {
-			info.Addrs[i] = addr.IPNet
+			info.Addrs[i] = types.NewIPNet(addr.IPNet)
 		}
 
 		if gw != nil {
@@ -157,7 +156,7 @@ func getLocalInterfaces() ([]types.IfaceInfo, error) {
 	return output, err
 }
 
-func publishIfaces(id modules.Identifier, db network.TNoDB) error {
+func publishIfaces(id pkg.Identifier, db network.TNoDB) error {
 	ifaces, err := getLocalInterfaces()
 	if err != nil {
 		return err
@@ -176,7 +175,7 @@ func publishIfaces(id modules.Identifier, db network.TNoDB) error {
 	return backoff.RetryNotify(f, backoff.NewExponentialBackOff(), errHandler)
 }
 
-func startServer(ctx context.Context, broker string, networker modules.Networker) error {
+func startServer(ctx context.Context, broker string, networker pkg.Networker) error {
 
 	server, err := zbus.NewRedisServer(module, broker, 1)
 	if err != nil {

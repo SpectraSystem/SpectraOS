@@ -1,1 +1,4 @@
-../../../../zinit/identityd.yaml
+exec: identityd -d
+after:
+  - boot
+  - flistd
