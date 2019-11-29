@@ -8,10 +8,10 @@ import (
 
 	"github.com/cenkalti/backoff/v3"
 	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/gedis"
 	"github.com/threefoldtech/zos/pkg/network"
@@ -29,6 +29,8 @@ const redisSocket = "unix:///var/run/redis.sock"
 const module = "network"
 
 func main() {
+	app.Initialize()
+
 	var (
 		root   string
 		broker string
@@ -47,8 +49,6 @@ func main() {
 	if err := network.DefaultBridgeValid(); err != nil {
 		log.Fatal().Err(err).Msg("invalid setup")
 	}
-
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	client, err := zbus.NewRedisClient(broker)
 	if err != nil {
@@ -76,7 +76,7 @@ func main() {
 	ifaceVersion := -1
 	exitIface, err := db.GetPubIface(nodeID)
 	if err == nil {
-		if err := configurePubIface(exitIface); err != nil {
+		if err := configurePubIface(exitIface, nodeID); err != nil {
 			log.Error().Err(err).Msg("failed to configure public interface")
 			os.Exit(1)
 		}
@@ -91,14 +91,14 @@ func main() {
 		for {
 			select {
 			case iface := <-ch:
-				_ = configurePubIface(iface)
+				_ = configurePubIface(iface, nodeID)
 			case <-ctx.Done():
 				return
 			}
 		}
 	}(ctx, chIface)
 
-	if err := ndmz.Create(); err != nil {
+	if err := ndmz.Create(nodeID); err != nil {
 		log.Fatal().Err(err).Msgf("failed to create DMZ")
 	}
 
@@ -203,7 +203,10 @@ func startServer(ctx context.Context, broker string, networker pkg.Networker) er
 
 // instantiate the proper client based on the running mode
 func bcdbClient() (network.TNoDB, error) {
-	env := environment.Get()
+	env, err := environment.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse node environment")
+	}
 
 	// use the bcdb mock for dev and test
 	if env.RunningMode == environment.RunningDev {
@@ -211,7 +214,7 @@ func bcdbClient() (network.TNoDB, error) {
 	}
 
 	// use gedis for production bcdb
-	store, err := gedis.New(env.BcdbURL, env.BcdbNamespace, env.BcdbPassword)
+	store, err := gedis.New(env.BcdbURL, env.BcdbPassword)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to connect to BCDB")
 	}

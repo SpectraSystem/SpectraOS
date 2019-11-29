@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"flag"
-	"os"
-
-	"github.com/rs/zerolog"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/threefoldtech/zbus"
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/storage"
 	"github.com/threefoldtech/zos/pkg/utils"
 	"github.com/threefoldtech/zos/pkg/version"
@@ -21,6 +19,8 @@ const (
 )
 
 func main() {
+	app.Initialize()
+
 	var (
 		msgBrokerCon string
 		workerNr     uint
@@ -35,8 +35,6 @@ func main() {
 	if ver {
 		version.ShowAndExit(false)
 	}
-
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	storage, err := storage.New()
 	if err != nil {

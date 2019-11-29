@@ -3,12 +3,11 @@ package main
 import (
 	"context"
 	"flag"
-	"os"
 
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/stubs"
 	"github.com/threefoldtech/zos/pkg/utils"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"github.com/threefoldtech/zbus"
@@ -19,7 +18,7 @@ import (
 const module = "flist"
 
 func main() {
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	app.Initialize()
 
 	var (
 		moduleRoot   string

@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+
+	"math/big"
 )
 
 var (
@@ -30,6 +32,16 @@ type Numeric string
 // Float64 returns parsed float64 value
 func (n Numeric) Float64() (float64, error) {
 	return strconv.ParseFloat(string(n), 64)
+}
+
+// BigInt returns parsed big.Int value
+func (n Numeric) BigInt() (*big.Int, error) {
+	bi := new(big.Int)
+	_, ok := bi.SetString(string(n), 10)
+	if !ok {
+		return nil, fmt.Errorf("failed to return '%s' as a big Int", n)
+	}
+	return bi, nil
 }
 
 // UnmarshalJSON method
@@ -135,6 +147,14 @@ func (d *Date) UnmarshalJSON(bytes []byte) error {
 
 // MarshalJSON formats a text
 func (d Date) MarshalJSON() ([]byte, error) {
+	if d.Time.IsZero() {
+		return []byte(`0`), nil
+	}
+	return []byte(fmt.Sprintf(`%d`, d.Unix())), nil
+}
+
+// String implements stringer interface
+func (d Date) String() ([]byte, error) {
 	if d.Time.IsZero() {
 		return []byte(`""`), nil
 	}

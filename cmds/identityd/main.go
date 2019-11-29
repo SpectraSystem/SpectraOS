@@ -2,14 +2,20 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/threefoldtech/zos/pkg/app"
+	"github.com/threefoldtech/zos/pkg/flist"
 	"github.com/threefoldtech/zos/pkg/gedis"
 	"github.com/threefoldtech/zos/pkg/geoip"
+	"github.com/threefoldtech/zos/pkg/stubs"
+	"github.com/threefoldtech/zos/pkg/upgrade"
 
 	"github.com/cenkalti/backoff/v3"
 	"github.com/threefoldtech/zos/pkg"
@@ -20,11 +26,8 @@ import (
 
 	"flag"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zbus"
-	"github.com/threefoldtech/zos/pkg/stubs"
-	"github.com/threefoldtech/zos/pkg/upgrade"
 	"github.com/threefoldtech/zos/pkg/utils"
 	"github.com/threefoldtech/zos/pkg/version"
 )
@@ -45,7 +48,7 @@ const (
 // for example, in case of upgraded crash after it already stopped all
 // the services for upgrade.
 func setup(zinit *zinit.Client) error {
-	for _, required := range []string{"redis", "flistd"} {
+	for _, required := range []string{"redis"} {
 		if err := zinit.StartWait(5*time.Second, required); err != nil {
 			return err
 		}
@@ -54,9 +57,9 @@ func setup(zinit *zinit.Client) error {
 	return nil
 }
 
-// SafeUpgrade makes sure upgrade daemon is not interrupted
-// While
-func SafeUpgrade(upgrader *upgrade.Upgrader) error {
+// Safe makes sure function call not interrupted
+// with a signal while exection
+func Safe(fn func() error) error {
 	ch := make(chan os.Signal)
 	defer close(ch)
 	defer signal.Stop(ch)
@@ -64,7 +67,7 @@ func SafeUpgrade(upgrader *upgrade.Upgrader) error {
 	// try to upgraded to latest
 	// but mean while also make sure the daemon can not be killed by a signal
 	signal.Notify(ch)
-	return upgrader.Upgrade()
+	return fn()
 }
 
 // This daemon startup has the follow flow:
@@ -75,12 +78,15 @@ func SafeUpgrade(upgrader *upgrade.Upgrader) error {
 // 5. On update, re-register the node with new version to BCDB
 
 func main() {
+	app.Initialize()
+
 	var (
 		broker   string
 		root     string
 		interval int
 		ver      bool
 		debug    bool
+		id       bool
 	)
 
 	flag.StringVar(&root, "root", "/var/cache/modules/identityd", "root working directory of the module")
@@ -88,38 +94,31 @@ func main() {
 	flag.IntVar(&interval, "interval", 600, "interval in seconds between update checks, default to 600")
 	flag.BoolVar(&ver, "v", false, "show version and exit")
 	flag.BoolVar(&debug, "d", false, "when set, no self update is done before upgradeing")
-
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	flag.BoolVar(&id, "id", false, "prints the node ID and exits")
 
 	flag.Parse()
 	if ver {
 		version.ShowAndExit(false)
 	}
 
+	if id {
+		client, err := zbus.NewRedisClient(broker)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to connect to zbus")
+		}
+		stub := stubs.NewIdentityManagerStub(client)
+		nodeID := stub.NodeID()
+		fmt.Println(nodeID)
+		os.Exit(0)
+	}
+
 	if err := os.MkdirAll(root, 0750); err != nil {
 		log.Fatal().Err(err).Str("root", root).Msg("failed to create root directory")
 	}
 
-	zinit, err := zinit.New(zinitSocket)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to zinit")
-	}
+	boot := upgrade.Boot{}
 
-	cl, err := zbus.NewRedisClient(broker)
-	if err != nil {
-		log.Error().Err(err).Msg("fail to connect to broker")
-		return
-	}
-
-	flister := stubs.NewFlisterStub(cl)
-
-	upgrader := upgrade.Upgrader{
-		FLister:      flister,
-		Zinit:        zinit,
-		NoSelfUpdate: debug,
-	}
-
-	bootMethod := upgrade.DetectBootMethod()
+	bootMethod := boot.DetectBootMethod()
 
 	// 2. Register the node to BCDB
 	// at this point we are running latest version
@@ -135,7 +134,7 @@ func main() {
 
 	var current string
 	if bootMethod == upgrade.BootMethodFList {
-		v, err := upgrader.Version()
+		v, err := boot.Version()
 		if err != nil {
 			//NOTE: this is set to error intentionally (not fatal)
 			//this will cause version to be 0.0.0 and will force an
@@ -162,9 +161,9 @@ func main() {
 		return registerNode(nodeID, farmID, v, idStore, loc)
 	}
 
-	if err := backoff.Retry(func() error {
+	if err := backoff.RetryNotify(func() error {
 		return register(current)
-	}, backoff.NewExponentialBackOff()); err != nil {
+	}, backoff.NewExponentialBackOff(), retryNotify); err != nil {
 		log.Error().Err(err).Msg("failed to register node")
 	} else {
 		log.Info().Str("version", current).Msg("node registered successfully")
@@ -198,47 +197,172 @@ func main() {
 		return
 	}
 
+	//NOTE: code after this commit will only
+	//run if the system is booted from an flist
+
 	// 4. Start watcher for new version
 	log.Info().Msg("start upgrade daemon")
-	ticker := time.NewTicker(time.Second * time.Duration(interval))
-	defer ticker.Stop()
+
+	upgradeLoop(ctx, &boot, root, debug, register)
+}
+
+func getBinsRepo() string {
+	env, _ := environment.Get()
+
+	switch env.RunningMode {
+	case environment.RunningDev:
+		return "tf-zos-bins.dev"
+	case environment.RunningTest:
+		return "tf-zos-bins.test"
+	default:
+		return "tf-zos-bins"
+	}
+}
+
+// allow reinstall if receive signal USR1
+// only allowed in debug mode
+func debugReinstall(boot *upgrade.Boot, up *upgrade.Upgrader) {
+	c := make(chan os.Signal)
+	signal.Notify(c, syscall.SIGUSR1)
+
+	go func() {
+		for range c {
+			current, err := boot.Current()
+			if err != nil {
+				log.Error().Err(err).Msg("couldn't get current flist info")
+				continue
+			}
+
+			up.Upgrade(current, current)
+		}
+	}()
+}
+func upgradeLoop(
+	ctx context.Context,
+	boot *upgrade.Boot,
+	root string,
+	debug bool,
+	register func(string) error) {
+
+	zinit, err := zinit.New(zinitSocket)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to connect to zinit")
+	}
+
+	// with volume allocation is set to nil this flister can be
+	// only used for RO mounts. Otherwise it will panic
+	flister := flist.New(root, nil)
+
+	upgrader := upgrade.Upgrader{
+		FLister:      flister,
+		Zinit:        zinit,
+		NoSelfUpdate: debug,
+	}
+
+	if debug {
+		debugReinstall(boot, &upgrader)
+	}
+
+	flistWatcher := upgrade.FListSemverWatcher{
+		FList:    boot.Name(),
+		Current:  boot.MustVersion(), //if we are here version must be valid
+		Duration: 600 * time.Second,
+	}
+
+	flistEvents, err := flistWatcher.Watch(ctx)
+	if err != nil {
+		log.Fatal().Err(err).Str("flist", flistWatcher.FList).Msg("failed to watch flist")
+	}
+
+	bins, err := boot.CurrentBins()
+	if err != nil {
+		log.Warn().Err(err).Msg("could not load current binaries list")
+	}
+
+	repoWatcher := upgrade.FListRepoWatcher{
+		Repo:    getBinsRepo(),
+		Current: bins,
+	}
+
+	repoEvents, err := repoWatcher.Watch(ctx)
+	if err != nil {
+		log.Fatal().Err(err).Str("repo", repoWatcher.Repo).Msg("failed to watch repo")
+	}
 
 	for {
-		err := SafeUpgrade(&upgrader)
-		if err == upgrade.ErrRestartNeeded {
-			log.Info().Msg("restarting upgraded")
+		select {
+		case <-ctx.Done():
 			return
-		} else if err != nil {
-			//TODO: crash or continue!
-			log.Error().Err(err).Msg("upgrade failed")
-		}
+		case e := <-flistEvents:
+			if e == nil {
+				continue
+			}
+			event := e.(*upgrade.FListEvent)
+			// new flist available
+			version, err := event.Version()
+			if err != nil {
+				log.Error().Err(err).Msg("failed to parse new version")
+				continue
+			}
 
-		version, err := upgrader.Version()
-		if err != nil {
-			log.Fatal().Err(err).Msg("failed to read current version")
-		}
+			from, err := boot.Current()
+			if err != nil {
+				log.Fatal().Err(err).Msg("failed to load current boot information")
+				return
+			}
 
-		if version.String() != current {
-			log.Info().Str("version", version.String()).Msg("new version")
+			err = Safe(func() error {
+				return upgrader.Upgrade(from, *event)
+			})
 
-			if err := backoff.Retry(func() error {
+			if err == upgrade.ErrRestartNeeded {
+				log.Info().Msg("restarting upgraded")
+				return
+			} else if err != nil {
+				//TODO: crash or continue!
+				log.Error().Err(err).Msg("upgrade failed")
+				continue
+			}
+
+			if err := boot.Set(*event); err != nil {
+				log.Error().Err(err).Msg("failed to update boot information")
+			}
+
+			if err := backoff.RetryNotify(func() error {
 				return register(version.String())
-			}, backoff.NewExponentialBackOff()); err != nil {
+			}, backoff.NewExponentialBackOff(), retryNotify); err != nil {
 				log.Error().Err(err).Msg("failed to register node")
 			} else {
 				log.Info().Str("version", version.String()).Msg("node registered successfully")
 			}
+		case e := <-repoEvents:
+			if e == nil {
+				continue
+			}
+			event := e.(*upgrade.RepoEvent)
+			for _, bin := range event.ToDel {
+				if err := upgrader.UninstallBinary(bin); err != nil {
+					log.Error().Err(err).Str("flist", bin.Fqdn()).Msg("failed to uninstall flist")
+				}
+			}
 
-			current = version.String()
-		}
+			for _, bin := range event.ToAdd {
+				if err := upgrader.InstallBinary(bin); err != nil {
+					log.Error().Err(err).Str("flist", bin.Fqdn()).Msg("failed to install flist")
+				}
+			}
 
-		select {
-		case <-ticker.C:
-			log.Debug().Msg("checking for updates")
-		case <-ctx.Done():
-			return
+			if err := boot.SetBins(repoWatcher.Current); err != nil {
+				log.Error().Err(err).Msg("failed to update local db of installed binaries")
+			}
+
+			log.Debug().Msg("finish processing binary updates")
 		}
 	}
+}
+
+func retryNotify(err error, d time.Duration) {
+	log.Warn().Err(err).Str("sleep", d.String()).Msg("registration failed")
 }
 
 func identityMgr(root string) (pkg.IdentityManager, error) {
@@ -249,7 +373,10 @@ func identityMgr(root string) (pkg.IdentityManager, error) {
 		return nil, err
 	}
 
-	env := environment.Get()
+	env, err := environment.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse node environment")
+	}
 
 	nodeID := manager.NodeID()
 	log.Info().
@@ -258,7 +385,7 @@ func identityMgr(root string) (pkg.IdentityManager, error) {
 
 	log.Info().
 		Bool("orphan", env.Orphan).
-		Str("farmer_id", env.FarmerID).
+		Uint64("farmer_id", uint64(env.FarmerID)).
 		Msg("farmer identified")
 
 	return manager, nil
@@ -266,7 +393,10 @@ func identityMgr(root string) (pkg.IdentityManager, error) {
 
 // instantiate the proper client based on the running mode
 func bcdbClient() (identity.IDStore, error) {
-	env := environment.Get()
+	env, err := environment.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse node environment")
+	}
 
 	// use the bcdb mock for dev and test
 	if env.RunningMode == environment.RunningDev {
@@ -274,18 +404,19 @@ func bcdbClient() (identity.IDStore, error) {
 	}
 
 	// use gedis for production bcdb
-	store, err := gedis.New(env.BcdbURL, env.BcdbNamespace, env.BcdbPassword)
+	store, err := gedis.New(env.BcdbURL, env.BcdbPassword)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to connect to BCDB")
 	}
 	return store, nil
 }
 
-func registerNode(nodeID, farmID pkg.Identifier, version string, store identity.IDStore, loc geoip.Location) error {
+func registerNode(nodeID pkg.Identifier, farmID pkg.FarmID, version string, store identity.IDStore, loc geoip.Location) error {
 	log.Info().Str("version", version).Msg("start registration of the node")
 
 	_, err := store.RegisterNode(nodeID, farmID, version, loc)
 	if err != nil {
+		log.Error().Err(err).Send()
 		return err
 	}
 	return nil

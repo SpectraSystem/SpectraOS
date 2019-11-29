@@ -2,14 +2,12 @@ package main
 
 import (
 	"flag"
-	"os"
 	"time"
-
-	"github.com/rs/zerolog"
 
 	"github.com/cenkalti/backoff/v3"
 
 	"github.com/pkg/errors"
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/capacity"
 	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/gedis"
@@ -24,6 +22,8 @@ import (
 const module = "capacity"
 
 func main() {
+	app.Initialize()
+
 	var (
 		msgBrokerCon string
 		ver          bool
@@ -36,8 +36,6 @@ func main() {
 	if ver {
 		version.ShowAndExit(false)
 	}
-
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	redis, err := zbus.NewRedisClient(msgBrokerCon)
 	if err != nil {
@@ -98,21 +96,20 @@ func main() {
 		log.Fatal().Err(err).Send()
 	}
 
-	for {
-		next := time.Now().Add(time.Minute * 10)
+	tick := time.NewTicker(time.Minute * 10)
+	defer tick.Stop()
 
-		if time.Now().After(next) {
-			backoff.Retry(sendUptime, backoff.NewExponentialBackOff())
-			continue
-		}
-
-		time.Sleep(time.Minute)
+	for range tick.C {
+		backoff.Retry(sendUptime, backoff.NewExponentialBackOff())
 	}
 }
 
 // instantiate the proper client based on the running mode
 func bcdbClient() (capacity.Store, error) {
-	env := environment.Get()
+	env, err := environment.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse node environment")
+	}
 
 	// use the bcdb mock for dev and test
 	if env.RunningMode == environment.RunningDev {
@@ -120,7 +117,7 @@ func bcdbClient() (capacity.Store, error) {
 	}
 
 	// use gedis for production bcdb
-	store, err := gedis.New(env.BcdbURL, env.BcdbNamespace, env.BcdbPassword)
+	store, err := gedis.New(env.BcdbURL, env.BcdbPassword)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to connect to BCDB")
 	}

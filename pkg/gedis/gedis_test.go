@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -100,11 +100,10 @@ func TestGedisSend(t *testing.T) {
 	pool, conn := getTestPool()
 
 	gedis := &Gedis{
-		pool:      pool,
-		namespace: "default",
+		pool: pool,
 	}
 
-	conn.On("Do", "default.actor.method", mock.AnythingOfType("[]uint8")).
+	conn.On("Do", "actor.method", mock.AnythingOfType("[]uint8")).
 		Return("mocked result", nil)
 
 	args := Args{
@@ -117,6 +116,6 @@ func TestGedisSend(t *testing.T) {
 
 	expected := mustMarshal(t, args)
 
-	conn.AssertCalled(t, "Do", "default.actor.method", expected)
+	conn.AssertCalled(t, "Do", "actor.method", expected)
 	conn.AssertCalled(t, "Close")
 }

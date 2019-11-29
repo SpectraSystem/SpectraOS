@@ -1,9 +1,15 @@
 build:
 	cd ../cmds && make internet
+	cd bootstrap && make release
 
 install: build
 	mkdir -p ${ROOT}/etc/zinit/
 	mkdir -p ${ROOT}/bin
-	cp -a etc ${ROOT}
+	mkdir -p ${ROOT}/sbin
+
+	# install interent
 	cp ../bin/internet ${ROOT}/bin
-	cp ../zinit/internet.yaml ${ROOT}/etc/zinit/
+
+	# install bootstrap
+	cp -a etc ${ROOT}
+	cp bootstrap/target/x86_64-unknown-linux-musl/release/bootstrap ${ROOT}/sbin/

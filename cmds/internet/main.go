@@ -7,10 +7,10 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/cenkalti/backoff"
-	"github.com/rs/zerolog"
+	"github.com/cenkalti/backoff/v3"
 	"github.com/rs/zerolog/log"
 
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/network"
 	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
 
@@ -19,6 +19,8 @@ import (
 )
 
 func main() {
+	app.Initialize()
+
 	var (
 		ver bool
 	)
@@ -28,8 +30,6 @@ func main() {
 	if ver {
 		version.ShowAndExit(false)
 	}
-
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	if err := ifaceutil.SetLoUp(); err != nil {
 		return

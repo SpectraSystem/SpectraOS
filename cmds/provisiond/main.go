@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/pkg/errors"
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/gedis"
 
@@ -22,7 +23,7 @@ import (
 )
 
 func main() {
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	app.Initialize()
 
 	var (
 		msgBrokerCon string
@@ -51,7 +52,10 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to create cache directory")
 	}
 
-	env := environment.Get()
+	env, err := environment.Get()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to parse node environment")
+	}
 
 	if env.Orphan {
 		// disable providiond on this node
@@ -117,7 +121,10 @@ type store interface {
 
 // instantiate the proper client based on the running mode
 func bcdbClient() (store, error) {
-	env := environment.Get()
+	env, err := environment.Get()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse node environment")
+	}
 
 	// use the bcdb mock for dev and test
 	if env.RunningMode == environment.RunningDev {
@@ -125,7 +132,7 @@ func bcdbClient() (store, error) {
 	}
 
 	// use gedis for production bcdb
-	store, err := gedis.New(env.BcdbURL, env.BcdbNamespace, env.BcdbPassword)
+	store, err := gedis.New(env.BcdbURL, env.BcdbPassword)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to connect to BCDB")
 	}

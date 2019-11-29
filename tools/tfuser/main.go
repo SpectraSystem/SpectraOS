@@ -170,6 +170,14 @@ func main() {
 							Name:  "ip",
 							Usage: "ip address to assign to the container",
 						},
+						cli.UintFlag{
+							Name:  "cpu",
+							Usage: "limit the amount of CPU allocated to the container",
+						},
+						cli.Uint64Flag{
+							Name:  "memory",
+							Usage: "limit the amount of memory a container can allocate",
+						},
 					},
 					Action: generateContainer,
 				},
@@ -264,6 +272,27 @@ func main() {
 			},
 			Action: cmdsProvision,
 		},
+		{
+			Name:  "live",
+			Usage: "show you all the reservations that are still alive",
+			Flags: []cli.Flag{
+				cli.StringFlag{
+					Name:   "seed",
+					Usage:  "path to the file container the seed of the user private key",
+					EnvVar: "SEED_PATH",
+				},
+				cli.IntFlag{
+					Name:  "start",
+					Usage: "start scrapping at that reservation ID",
+				},
+				cli.IntFlag{
+					Name:  "end",
+					Usage: "end scrapping at that reservation ID",
+					Value: 500,
+				},
+			},
+			Action: cmdsLive,
+		},
 	}
 
 	err := app.Run(os.Args)
@@ -298,7 +327,7 @@ func getClient(addr string) (clientIface, error) {
 			provision.NewHTTPStore(addr),
 		}, nil
 	case "tcp":
-		c, err := gedis.New(addr, "default", "")
+		c, err := gedis.New(addr, "")
 		return client{
 			c,
 			c,

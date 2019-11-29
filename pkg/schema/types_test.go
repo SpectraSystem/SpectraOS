@@ -2,9 +2,12 @@ package schema
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -34,6 +37,38 @@ func TestParseDate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNumericBigInt(t *testing.T) {
+	const inputValue = "1344719667586153181419716641724567886890850696275767987106294472017884974410332069524504824747437757"
+	var n Numeric
+	err := n.UnmarshalJSON([]byte(fmt.Sprintf(`"%s"`, inputValue)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bi, err := n.BigInt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := bi.String()
+	if inputValue != output {
+		t.Fatalf("%s != %s", inputValue, output)
+	}
+}
+
+func TestDateNil(t *testing.T) {
+	var d Date
+
+	b, err := json.Marshal(d)
+	require.NoError(t, err)
+
+	assert.Equal(t, []byte(`0`), b)
+
+	d = Date{Time: time.Unix(500, 0)}
+	b, err = json.Marshal(d)
+	require.NoError(t, err)
+
+	assert.Equal(t, []byte(`500`), b)
 }
 
 func TestParseIPRange(t *testing.T) {
