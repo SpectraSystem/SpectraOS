@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"context"
 	"net"
 
 	"github.com/threefoldtech/zos/pkg/network/types"
@@ -40,9 +41,32 @@ type Networker interface {
 	// hw is an optional hardware address that will be set on the new interface
 	ZDBPrepare(hw net.HardwareAddr) (string, error)
 
+	// SetupTap sets up a tap device in the network namespace for the networkID. It is hooked
+	// to the network bridge. The name of the tap interface is returned
+	SetupTap(networkID NetID) (string, error)
+
+	// RemoveTap removes the tap device from the network namespace
+	// of the networkID
+	RemoveTap(networkID NetID) error
+
+	// GetSubnet of the network with the given ID on the local node
+	GetSubnet(networkID NetID) (net.IPNet, error)
+
+	// GetDefaultGwIP returns the IP(v4) of the default gateway inside the network
+	// resource identified by the network ID on the local node
+	GetDefaultGwIP(networkID NetID) (net.IP, error)
+
 	// Addrs return the IP addresses of interface
 	// if the interface is in a network namespace netns needs to be not empty
 	Addrs(iface string, netns string) ([]net.IP, error)
+
+	// ZOSAddresses monitoring streams for ZOS bridge IPs
+	ZOSAddresses(ctx context.Context) <-chan NetlinkAddresses
+
+	// DMZAddresses monitoring streams for dmz public interface
+	DMZAddresses(ctx context.Context) <-chan NetlinkAddresses
+
+	PublicAddresses(ctx context.Context) <-chan NetlinkAddresses
 }
 
 // Network represent the description if a user private network

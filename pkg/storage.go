@@ -1,11 +1,13 @@
 package pkg
 
 import (
+	"context"
 	"fmt"
 )
 
 //go:generate mkdir -p stubs
 //go:generate zbusc -module storage -version 0.0.1 -name storage -package stubs github.com/threefoldtech/zos/pkg+StorageModule stubs/storage_stub.go
+//go:generate zbusc -module storage -version 0.0.1 -name vdisk -package stubs github.com/threefoldtech/zos/pkg+VDiskModule stubs/vdisk_stub.go
 
 // RaidProfile type
 type RaidProfile string
@@ -123,6 +125,26 @@ type VolumeAllocater interface {
 	Path(name string) (path string, err error)
 }
 
+// VDisk info returned by a call to inspect
+type VDisk struct {
+	// Path to disk
+	Path string
+	// Size in bytes
+	Size int64
+}
+
+// VDiskModule interface
+type VDiskModule interface {
+	// AllocateDisk with given id and size, return path to virtual disk
+	Allocate(id string, size int64) (string, error)
+	// DeallocateVDisk removes a virtual disk
+	Deallocate(id string) error
+	// Exists checks if disk with that ID already allocated
+	Exists(id string) bool
+	// Inspect return info about the disk
+	Inspect(id string) (VDisk, error)
+}
+
 // StorageModule defines the api for storage
 type StorageModule interface {
 	VolumeAllocater
@@ -134,4 +156,7 @@ type StorageModule interface {
 	BrokenPools() []BrokenPool
 	// BrokenDevices lists the broken devices that have been detected
 	BrokenDevices() []BrokenDevice
+
+	//Monitor returns stats stream about pools
+	Monitor(ctx context.Context) <-chan PoolsStats
 }

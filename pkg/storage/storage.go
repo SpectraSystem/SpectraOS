@@ -2,15 +2,17 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+	"github.com/shirou/gopsutil/disk"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/storage/filesystem"
 )
@@ -326,7 +328,8 @@ func (s *storageModule) Path(name string) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("Could not find filesystem %v", name)
+
+	return "", errors.Wrapf(os.ErrNotExist, "subvolume '%s' not found", name)
 }
 
 // ensureCache creates a "cache" subvolume and mounts it in /var
@@ -453,4 +456,60 @@ func (s *storageModule) createSubvol(size uint64, name string, poolType pkg.Devi
 	}
 
 	return nil, fmt.Errorf("failed to create subvolume, logs might have more information")
+}
+
+func (s *storageModule) Monitor(ctx context.Context) <-chan pkg.PoolsStats {
+	ch := make(chan pkg.PoolsStats)
+	values := make(pkg.PoolsStats)
+	go func() {
+		defer close(ch)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+
+			for _, pool := range s.volumes {
+				devices, err := s.devices.ByLabel(ctx, pool.Name())
+				if err != nil {
+					log.Error().Err(err).Str("pool", pool.Name()).Msg("failed to get devices for pool")
+					continue
+				}
+
+				var deviceNames []string
+				for _, device := range devices {
+					deviceNames = append(deviceNames, device.Path)
+				}
+
+				usage, err := disk.UsageWithContext(ctx, pool.Path())
+				if err != nil {
+					log.Error().Err(err).Str("pool", pool.Name()).Msg("failed to get pool usage")
+					continue
+				}
+				stats, err := disk.IOCountersWithContext(ctx, deviceNames...)
+				if err != nil {
+					log.Error().Err(err).Str("pool", pool.Name()).Msg("failed to get io stats for pool")
+					continue
+				}
+
+				poolStats := pkg.PoolStats{
+					UsageStat: *usage,
+					Counters:  stats,
+				}
+
+				values[pool.Name()] = poolStats
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- values:
+			}
+		}
+
+	}()
+
+	return ch
 }

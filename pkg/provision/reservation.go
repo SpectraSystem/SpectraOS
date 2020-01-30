@@ -26,6 +26,8 @@ const (
 	ZDBReservation ReservationType = "zdb"
 	// DebugReservation type
 	DebugReservation ReservationType = "debug"
+	// KubernetesReservation type
+	KubernetesReservation ReservationType = "kubernetes"
 )
 
 var (
@@ -39,6 +41,8 @@ var (
 type Reservation struct {
 	// ID of the reservation
 	ID string `json:"id"`
+	// NodeID of the node where to deploy this reservation
+	NodeID string `json:"node_id"`
 	// Identification of the user requesting the reservation
 	User string `json:"user_id"`
 	// Type of the reservation (container, zdb, vm, etc...)

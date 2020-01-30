@@ -6,18 +6,21 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/stubs"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 )
 
-// ReservationReadWriter define the interface to store
+// ReservationCache define the interface to store
 // some reservations
-type ReservationReadWriter interface {
+type ReservationCache interface {
 	Add(r *Reservation) error
 	Get(id string) (*Reservation, error)
 	Remove(id string) error
+	Exists(id string) (bool, error)
+	Counters() pkg.ProvisionCounters
 }
 
 // Feedbacker defines the method that needs to be implemented
@@ -29,7 +32,7 @@ type Feedbacker interface {
 
 type defaultEngine struct {
 	source ReservationSource
-	store  ReservationReadWriter
+	store  ReservationCache
 	fb     Feedbacker
 }
 
@@ -39,7 +42,7 @@ type defaultEngine struct {
 // the default implementation is a single threaded worker. so it process
 // one reservation at a time. On error, the engine will log the error. and
 // continue to next reservation.
-func New(source ReservationSource, rw ReservationReadWriter, fb Feedbacker) Engine {
+func New(source ReservationSource, rw ReservationCache, fb Feedbacker) Engine {
 	return &defaultEngine{
 		source: source,
 		store:  rw,
@@ -79,12 +82,13 @@ func (e *defaultEngine) Run(ctx context.Context) error {
 				slog.Info().Msg("start decommissioning reservation")
 				if err := e.decommission(ctx, reservation); err != nil {
 					log.Error().Err(err).Msgf("failed to decommission reservation %s", reservation.ID)
+					continue
 				}
-				slog.Info().Msg("reservation decommission successful")
 			} else {
 				slog.Info().Msg("start provisioning reservation")
 				if err := e.provision(ctx, reservation); err != nil {
 					log.Error().Err(err).Msgf("failed to provision reservation %s", reservation.ID)
+					continue
 				}
 			}
 		}
@@ -130,7 +134,20 @@ func (e *defaultEngine) decommission(ctx context.Context, r *Reservation) error 
 		return fmt.Errorf("type of reservation not supported: %s", r.Type)
 	}
 
-	err := fn(ctx, r)
+	exists, err := e.store.Exists(r.ID)
+	if err != nil {
+		return errors.Wrapf(err, "failed to check if reservation %s exists in cache", r.ID)
+	}
+
+	if !exists {
+		log.Info().Str("id", r.ID).Msg("reservation not provisioned, no need to decomission")
+		if err := e.fb.Deleted(r.ID); err != nil {
+			log.Error().Err(err).Str("id", r.ID).Msg("failed to mark reservation as deleted")
+		}
+		return nil
+	}
+
+	err = fn(ctx, r)
 	if err != nil {
 		return errors.Wrap(err, "decommissioning of reservation failed")
 	}
@@ -189,4 +206,23 @@ func (e *defaultEngine) reply(ctx context.Context, r *Reservation, rErr error, i
 	result.Signature = sig
 
 	return e.fb.Feedback(r.ID, result)
+}
+
+func (e *defaultEngine) Counters(ctx context.Context) <-chan pkg.ProvisionCounters {
+	ch := make(chan pkg.ProvisionCounters)
+	go func() {
+		for {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+			}
+
+			select {
+			case <-ctx.Done():
+			case ch <- e.store.Counters():
+			}
+		}
+	}()
+
+	return ch
 }

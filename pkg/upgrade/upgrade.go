@@ -377,11 +377,13 @@ func copyRecursive(source string, destination string, skip ...string) error {
 			if err := os.MkdirAll(dest, info.Mode()); err != nil {
 				return err
 			}
-		} else {
+		} else if info.Mode().IsRegular() {
 			// regular file (or other types that we don't handle)
 			if err := copyFile(dest, path); err != nil {
 				return err
 			}
+		} else {
+			log.Debug().Str("type", info.Mode().String()).Msg("ignoring not suppored file type")
 		}
 
 		return nil

@@ -3,6 +3,7 @@ package gedis
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"sort"
 	"time"
 
@@ -17,15 +18,16 @@ import (
 // provisionOrder is used to sort the workload type
 // in the right order for provisiond
 var provisionOrder = map[provision.ReservationType]int{
-	provision.DebugReservation:     0,
-	provision.NetworkReservation:   1,
-	provision.ZDBReservation:       2,
-	provision.VolumeReservation:    3,
-	provision.ContainerReservation: 4,
+	provision.DebugReservation:      0,
+	provision.NetworkReservation:    1,
+	provision.ZDBReservation:        2,
+	provision.VolumeReservation:     3,
+	provision.ContainerReservation:  4,
+	provision.KubernetesReservation: 5,
 }
 
 // Reserve provision.Reserver
-func (g *Gedis) Reserve(r *provision.Reservation, nodeID pkg.Identifier) (string, error) {
+func (g *Gedis) Reserve(r *provision.Reservation) (string, error) {
 	res := types.TfgridReservation1{
 		DataReservation: types.TfgridReservationData1{},
 		// CustomerTid:     r.User, //TODO: wrong type.
@@ -35,24 +37,27 @@ func (g *Gedis) Reserve(r *provision.Reservation, nodeID pkg.Identifier) (string
 	if err != nil {
 		return "", err
 	}
-	nID := nodeID.Identity()
 
 	switch r.Type {
 	case provision.ContainerReservation:
 		res.DataReservation.Containers = []types.TfgridReservationContainer1{
-			containerReservation(w, nID),
+			containerReservation(w, r.NodeID),
 		}
 	case provision.VolumeReservation:
 		res.DataReservation.Volumes = []types.TfgridReservationVolume1{
-			volumeReservation(w, nID),
+			volumeReservation(w, r.NodeID),
 		}
 	case provision.ZDBReservation:
 		res.DataReservation.Zdbs = []types.TfgridReservationZdb1{
-			zdbReservation(w, nID),
+			zdbReservation(w, r.NodeID),
 		}
 	case provision.NetworkReservation:
 		res.DataReservation.Networks = []types.TfgridReservationNetwork1{
 			networkReservation(w),
+		}
+	case provision.KubernetesReservation:
+		res.DataReservation.Kubernetes = []types.TfgridWorkloadsReservationK8S1{
+			k8sReservation(w, r.NodeID),
 		}
 	}
 
@@ -173,7 +178,18 @@ func (g *Gedis) Feedback(id string, r *provision.Result) error {
 }
 
 // Deleted implements provision.Feedbacker
-func (g *Gedis) Deleted(id string) error { return nil }
+func (g *Gedis) Deleted(id string) error {
+	_, err := g.Send("tfgrid.workloads.workload_manager", "workload_deleted", Args{})
+	return err
+}
+
+// Delete marks a reservation to be deleted
+func (g *Gedis) Delete(id string) error {
+	_, err := g.Send("tfgrid.workloads.workload_manager", "sign_delete", Args{
+		"reservation_id": id,
+	})
+	return err
+}
 
 func reservationFromSchema(w types.TfgridReservationWorkload1) (*provision.Reservation, error) {
 	reservation := &provision.Reservation{
@@ -200,7 +216,7 @@ func reservationFromSchema(w types.TfgridReservationWorkload1) (*provision.Reser
 			return nil, err
 		}
 
-		data, err = tmp.ToProvisionType()
+		data, reservation.NodeID, err = tmp.ToProvisionType()
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +227,7 @@ func reservationFromSchema(w types.TfgridReservationWorkload1) (*provision.Reser
 			return nil, err
 		}
 
-		data, err = tmp.ToProvisionType()
+		data, reservation.NodeID, err = tmp.ToProvisionType()
 		if err != nil {
 			return nil, err
 		}
@@ -233,10 +249,22 @@ func reservationFromSchema(w types.TfgridReservationWorkload1) (*provision.Reser
 			return nil, err
 		}
 
-		data, err = tmp.ToProvisionType()
+		data, reservation.NodeID, err = tmp.ToProvisionType()
 		if err != nil {
 			return nil, err
 		}
+
+	case provision.KubernetesReservation:
+		tmp := types.TfgridWorkloadsReservationK8S1{}
+		if err := json.Unmarshal(reservation.Data, &tmp); err != nil {
+			return nil, err
+		}
+
+		data, reservation.NodeID, err = tmp.ToProvisionType()
+		if err != nil {
+			return nil, err
+		}
+
 	}
 
 	reservation.Data, err = json.Marshal(data)
@@ -268,6 +296,11 @@ func workloadFromRaw(s json.RawMessage, t provision.ReservationType) (interface{
 		z := provision.ZDB{}
 		err := json.Unmarshal([]byte(s), &z)
 		return z, err
+
+	case provision.KubernetesReservation:
+		k := provision.Kubernetes{}
+		err := json.Unmarshal([]byte(s), &k)
+		return k, err
 	}
 
 	return nil, fmt.Errorf("unsupported reservation type %v", t)
@@ -381,4 +414,29 @@ func zdbReservation(i interface{}, nodeID string) types.TfgridReservationZdb1 {
 	}
 
 	return zdb
+}
+
+func k8sReservation(i interface{}, nodeID string) types.TfgridWorkloadsReservationK8S1 {
+	k := i.(provision.Kubernetes)
+
+	k8s := types.TfgridWorkloadsReservationK8S1{
+		// WorkloadID      int64
+		NodeID:        nodeID,
+		Size:          k.Size,
+		NetworkID:     string(k.NetworkID),
+		Ipaddress:     k.IP,
+		ClusterSecret: k.ClusterSecret,
+		MasterIps:     make([]net.IP, 0, len(k.MasterIPs)),
+		SSHKeys:       make([]string, 0, len(k.SSHKeys)),
+	}
+
+	for i, ip := range k.MasterIPs {
+		k8s.MasterIps[i] = ip
+	}
+
+	for i, key := range k.SSHKeys {
+		k8s.SSHKeys[i] = key
+	}
+
+	return k8s
 }

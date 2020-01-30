@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/crypto"
 	"github.com/threefoldtech/zos/pkg/identity"
 	"github.com/threefoldtech/zos/pkg/provision"
 
@@ -19,6 +21,43 @@ import (
 var (
 	day             = time.Hour * 24
 	defaultDuration = day * 30
+)
+
+func encryptPassword(password, nodeID string) (string, error) {
+	if len(password) == 0 {
+		return "", nil
+	}
+
+	pubkey, err := crypto.KeyFromID(pkg.StrIdentifier(nodeID))
+	if err != nil {
+		return "", err
+	}
+
+	encrypted, err := crypto.Encrypt([]byte(password), pubkey)
+	return hex.EncodeToString(encrypted), err
+}
+
+func provisionCustomZDB(r *provision.Reservation) error {
+	var config provision.ZDB
+	if err := json.Unmarshal(r.Data, &config); err != nil {
+		return errors.Wrap(err, "failed to load zdb reservation schema")
+	}
+
+	encrypted, err := encryptPassword(config.Password, r.NodeID)
+	if err != nil {
+		return err
+	}
+
+	config.Password = encrypted
+	r.Data, err = json.Marshal(config)
+
+	return err
+}
+
+var (
+	provCustomModifiers = map[provision.ReservationType]func(r *provision.Reservation) error{
+		provision.ZDBReservation: provisionCustomZDB,
+	}
 )
 
 func cmdsProvision(c *cli.Context) error {
@@ -61,25 +100,33 @@ func cmdsProvision(c *cli.Context) error {
 
 	r.Duration = duration
 	r.Created = time.Now()
-
 	// set the user ID into the reservation schema
 	r.User = keypair.Identity()
 
-	if err := r.Sign(keypair.PrivateKey); err != nil {
-		return errors.Wrap(err, "failed to sign the reservation")
-	}
-
-	if err := output(path, r); err != nil {
-		return errors.Wrapf(err, "failed to write provision schema to %s after signature", path)
-	}
-
 	for _, nodeID := range nodeIDs {
-		id, err := client.Reserve(r, pkg.StrIdentifier(nodeID))
+		r.NodeID = nodeID
+
+		custom, ok := provCustomModifiers[r.Type]
+		if ok {
+			if err := custom(r); err != nil {
+				return err
+			}
+		}
+
+		if err := r.Sign(keypair.PrivateKey); err != nil {
+			return errors.Wrap(err, "failed to sign the reservation")
+		}
+
+		if err := output(path, r); err != nil {
+			return errors.Wrapf(err, "failed to write provision schema to %s after signature", path)
+		}
+
+		id, err := client.Reserve(r)
 		if err != nil {
 			return errors.Wrap(err, "failed to send reservation")
 		}
 
-		fmt.Printf("Reservation for %v send to node %s\n", duration, nodeID)
+		fmt.Printf("Reservation for %v send to node %s\n", duration, r.NodeID)
 		fmt.Printf("Resource: %v\n", id)
 	}
 
@@ -98,4 +145,14 @@ func embed(schema interface{}, t provision.ReservationType) (*provision.Reservat
 	}
 
 	return r, nil
+}
+
+func cmdsDeleteReservation(c *cli.Context) error {
+	id := c.String("id")
+
+	if err := client.Delete(id); err != nil {
+		return errors.Wrapf(err, "failed to mark reservation %s to be deleted", id)
+	}
+	fmt.Printf("Reservation %v marked as to be deleted\n", id)
+	return nil
 }

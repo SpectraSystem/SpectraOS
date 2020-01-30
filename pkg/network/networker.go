@@ -1,14 +1,17 @@
 package network
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/threefoldtech/zos/pkg/network/ndmz"
+	"github.com/threefoldtech/zos/pkg/network/tuntap"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
@@ -197,13 +200,17 @@ func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
 	defer netNs.Close()
 
 	// find which interface to use as master for the macvlan
-	pubIface := DefaultBridge
+	var pubIface string
 	if namespace.Exists(types.PublicNamespace) {
-		master, err := publicMasterIface()
+		pubIface, err = publicMasterIface()
 		if err != nil {
 			return "", errors.Wrap(err, "failed to retrieve the master interface name of the public interface")
 		}
-		pubIface = master
+	} else {
+		pubIface, err = ifaceutil.HostIPV6Iface()
+		if err != nil {
+			return "", errors.Wrap(err, "failed to found a valid network interface to use as parent for 0-db container")
+		}
 	}
 
 	macVlan, err := macvlan.Create(ZDBIface, pubIface, netNs)
@@ -218,6 +225,113 @@ func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
 	}
 
 	return netNSName, nil
+}
+
+// SetupTap interface in the network resource. We only allow 1 tap interface to be
+// set up per NR currently
+func (n *networker) SetupTap(networkID pkg.NetID) (string, error) {
+	log.Info().Str("network-id", string(networkID)).Msg("Setting up tap interface")
+
+	network, err := n.networkOf(string(networkID))
+	if err != nil {
+		return "", errors.Wrapf(err, "couldn't load network with id (%s)", networkID)
+	}
+
+	nodeID := n.identity.NodeID().Identity()
+	localNR, err := ResourceByNodeID(nodeID, network.NetResources)
+	if err != nil {
+		return "", err
+	}
+
+	netRes, err := nr.New(networkID, localNR, &network.IPRange.IPNet)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to load network resource")
+	}
+
+	bridgeName, err := netRes.BridgeName()
+	if err != nil {
+		return "", errors.Wrap(err, "could not get network namespace bridge")
+	}
+
+	tapIface, err := netRes.TapName()
+	if err != nil {
+		return "", errors.Wrap(err, "could not get network namespace tap device name")
+	}
+
+	_, err = tuntap.CreateTap(tapIface, bridgeName)
+
+	return tapIface, err
+}
+
+// RemoveTap in the network resource.
+func (n *networker) RemoveTap(networkID pkg.NetID) error {
+	log.Info().Str("network-id", string(networkID)).Msg("Removing tap interface")
+
+	network, err := n.networkOf(string(networkID))
+	if err != nil {
+		return errors.Wrapf(err, "couldn't load network with id (%s)", networkID)
+	}
+
+	nodeID := n.identity.NodeID().Identity()
+	localNR, err := ResourceByNodeID(nodeID, network.NetResources)
+	if err != nil {
+		return err
+	}
+
+	netRes, err := nr.New(networkID, localNR, &network.IPRange.IPNet)
+	if err != nil {
+		return errors.Wrap(err, "failed to load network resource")
+	}
+
+	tapIface, err := netRes.TapName()
+	if err != nil {
+		return errors.Wrap(err, "could not get network namespace tap device name")
+	}
+
+	return ifaceutil.Delete(tapIface, nil)
+}
+
+// GetSubnet of a local network resource identified by the network ID
+func (n networker) GetSubnet(networkID pkg.NetID) (net.IPNet, error) {
+	network, err := n.networkOf(string(networkID))
+	if err != nil {
+		return net.IPNet{}, errors.Wrapf(err, "couldn't load network with id (%s)", networkID)
+	}
+
+	nodeID := n.identity.NodeID().Identity()
+	localNR, err := ResourceByNodeID(nodeID, network.NetResources)
+	if err != nil {
+		return net.IPNet{}, err
+	}
+
+	return localNR.Subnet.IPNet, nil
+}
+
+// GetDefaultGwIP returns the IP(v4) of the default gateway inside the network
+// resource identified by the network ID on the local node
+func (n networker) GetDefaultGwIP(networkID pkg.NetID) (net.IP, error) {
+	network, err := n.networkOf(string(networkID))
+	if err != nil {
+		return nil, errors.Wrapf(err, "couldn't load network with id (%s)", networkID)
+	}
+
+	nodeID := n.identity.NodeID().Identity()
+	localNR, err := ResourceByNodeID(nodeID, network.NetResources)
+	if err != nil {
+		return nil, err
+	}
+
+	// only IP4 atm
+	ip := localNR.Subnet.IP.To4()
+	if ip == nil {
+		return nil, errors.New("nr subnet is not valid IPv4")
+	}
+
+	// defaut gw is currently implied to be at `x.x.x.1`
+	// also a subnet in a NR is assumed to be a /24
+	ip[len(ip)-1] = 1
+
+	return ip, nil
 }
 
 // Addrs return the IP addresses of interface
@@ -475,6 +589,140 @@ func (n *networker) releasePort(port uint16) error {
 	return nil
 }
 
+func (n *networker) getAddresses(nsName, link string) ([]netlink.Addr, error) {
+	netns, err := namespace.GetByName(nsName)
+	if err != nil {
+		return nil, err
+	}
+
+	defer netns.Close()
+	var addr []netlink.Addr
+	err = netns.Do(func(_ ns.NetNS) error {
+		link, err := netlink.LinkByName(link)
+		if err != nil {
+			return err
+		}
+		addr, err = netlink.AddrList(link, netlink.FAMILY_ALL)
+		return err
+	})
+
+	return addr, err
+}
+
+func (n *networker) monitorNS(ctx context.Context, name, link string) <-chan pkg.NetlinkAddresses {
+	get := func() (pkg.NetlinkAddresses, error) {
+		var result pkg.NetlinkAddresses
+		values, err := n.getAddresses(name, link)
+		for _, value := range values {
+			result = append(result, pkg.NetlinkAddress(value))
+		}
+
+		return result, err
+	}
+
+	addresses, _ := get()
+	ch := make(chan pkg.NetlinkAddresses)
+	go func() {
+		monitorCtx, cancel := context.WithCancel(context.Background())
+
+		defer func() {
+			close(ch)
+			cancel()
+		}()
+
+	main:
+		for {
+			updates, err := namespace.Monitor(monitorCtx, name)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(30 * time.Second):
+					continue
+				}
+			}
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-updates:
+					addresses, err = get()
+					if err != nil {
+						// this might be duo too namespace was deleted, hence
+						// we need to try find the namespace object again
+						cancel()
+						monitorCtx, cancel = context.WithCancel(context.Background())
+						continue main
+					}
+				case <-time.After(2 * time.Second):
+					ch <- addresses
+				}
+			}
+
+		}
+	}()
+
+	return ch
+}
+
+func (n *networker) DMZAddresses(ctx context.Context) <-chan pkg.NetlinkAddresses {
+	return n.monitorNS(ctx, ndmz.NetNSNDMZ, ndmz.PublicIfaceName)
+}
+
+func (n *networker) PublicAddresses(ctx context.Context) <-chan pkg.NetlinkAddresses {
+	return n.monitorNS(ctx, types.PublicNamespace, types.PublicIface)
+}
+
+func (n *networker) ZOSAddresses(ctx context.Context) <-chan pkg.NetlinkAddresses {
+	// we don't use monitorNS because
+	// 1- this is the host namespace
+	// 2- the ZOS bridge must exist all the time
+	updates := make(chan netlink.AddrUpdate)
+	if err := netlink.AddrSubscribe(updates, ctx.Done()); err != nil {
+		log.Fatal().Err(err).Msg("failed to listen to netlink address updates")
+	}
+
+	link, err := netlink.LinkByName(DefaultBridge)
+	if err != nil {
+		log.Fatal().Err(err).Msgf("could not find the '%s' bridge", DefaultBridge)
+	}
+
+	get := func() pkg.NetlinkAddresses {
+		var result pkg.NetlinkAddresses
+		values, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
+		for _, value := range values {
+			result = append(result, pkg.NetlinkAddress(value))
+		}
+
+		return result
+	}
+
+	addresses := get()
+
+	ch := make(chan pkg.NetlinkAddresses)
+	go func() {
+		defer close(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case update := <-updates:
+				if update.LinkIndex != link.Attrs().Index {
+					continue
+				}
+
+				addresses = get()
+			case <-time.After(2 * time.Second):
+				ch <- addresses
+			}
+		}
+	}()
+
+	return ch
+
+}
+
 // publicMasterIface return the name of the master interface
 // of the public interface
 func publicMasterIface() (string, error) {
@@ -484,27 +732,28 @@ func publicMasterIface() (string, error) {
 	}
 	defer netns.Close()
 
-	var iface string
+	var index int
 	if err := netns.Do(func(_ ns.NetNS) error {
 		pl, err := netlink.LinkByName(types.PublicIface)
 		if err != nil {
 			return err
 		}
-		index := pl.Attrs().MasterIndex
-		if index == 0 {
-			return fmt.Errorf("public iface has not master")
-		}
-		ml, err := netlink.LinkByIndex(index)
-		if err != nil {
-			return err
-		}
-		iface = ml.Attrs().Name
+		index = pl.Attrs().ParentIndex
 		return nil
 	}); err != nil {
 		return "", err
 	}
 
-	return iface, nil
+	if index == 0 {
+		return "", fmt.Errorf("public iface has not master")
+	}
+
+	ml, err := netlink.LinkByIndex(index)
+	if err != nil {
+		return "", err
+	}
+
+	return ml.Attrs().Name, nil
 }
 
 // createNetNS create a network namespace and set lo interface up

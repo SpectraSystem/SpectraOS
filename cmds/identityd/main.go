@@ -169,6 +169,7 @@ func main() {
 		log.Info().Str("version", current).Msg("node registered successfully")
 	}
 
+	monitor := newVersionMonitor(2 * time.Second)
 	// 3. start zbus server to serve identity interface
 	server, err := zbus.NewRedisServer(module, broker, 1)
 	if err != nil {
@@ -176,6 +177,7 @@ func main() {
 	}
 
 	server.Register(zbus.ObjectID{Name: "manager", Version: "0.0.1"}, idMgr)
+	server.Register(zbus.ObjectID{Name: "monitor", Version: "0.0.1"}, monitor)
 
 	ctx, cancel := utils.WithSignal(context.Background())
 	// register the cancel function with defer if the process stops because of a update
@@ -186,6 +188,23 @@ func main() {
 			log.Error().Err(err).Msg("unexpected error")
 		}
 	}()
+
+	zinit, err := zinit.New(zinitSocket)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to connect to zinit")
+	}
+
+	// with volume allocation is set to nil this flister can be
+	// only used for RO mounts. Otherwise it will panic
+	flister := flist.New(root, nil)
+
+	upgrader := upgrade.Upgrader{
+		FLister:      flister,
+		Zinit:        zinit,
+		NoSelfUpdate: debug,
+	}
+
+	installBinaries(&boot, &upgrader)
 
 	utils.OnDone(ctx, func(_ error) {
 		log.Info().Msg("received a termination signal")
@@ -203,7 +222,7 @@ func main() {
 	// 4. Start watcher for new version
 	log.Info().Msg("start upgrade daemon")
 
-	upgradeLoop(ctx, &boot, root, debug, register)
+	upgradeLoop(ctx, &boot, &upgrader, debug, monitor, register)
 }
 
 func getBinsRepo() string {
@@ -244,30 +263,45 @@ func debugReinstall(boot *upgrade.Boot, up *upgrade.Upgrader) {
 	}()
 }
 
+func installBinaries(boot *upgrade.Boot, upgrader *upgrade.Upgrader) {
+
+	bins, _ := boot.CurrentBins()
+
+	repoWatcher := upgrade.FListRepoWatcher{
+		Repo:    getBinsRepo(),
+		Current: bins,
+	}
+
+	current, toAdd, toDel, err := repoWatcher.Diff()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to list latest binaries to install")
+	}
+
+	for _, pkg := range toDel {
+		if err := upgrader.UninstallBinary(pkg); err != nil {
+			log.Error().Err(err).Str("flist", pkg.Fqdn()).Msg("failed to uninstall flist")
+		}
+	}
+
+	for _, pkg := range toAdd {
+		if err := upgrader.InstallBinary(pkg); err != nil {
+			log.Error().Err(err).Str("package", pkg.Fqdn()).Msg("failed to install package")
+		}
+	}
+
+	boot.SetBins(current)
+}
+
 func upgradeLoop(
 	ctx context.Context,
 	boot *upgrade.Boot,
-	root string,
+	upgrader *upgrade.Upgrader,
 	debug bool,
+	monitor *monitorStream,
 	register func(string) error) {
 
-	zinit, err := zinit.New(zinitSocket)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to zinit")
-	}
-
-	// with volume allocation is set to nil this flister can be
-	// only used for RO mounts. Otherwise it will panic
-	flister := flist.New(root, nil)
-
-	upgrader := upgrade.Upgrader{
-		FLister:      flister,
-		Zinit:        zinit,
-		NoSelfUpdate: debug,
-	}
-
 	if debug {
-		debugReinstall(boot, &upgrader)
+		debugReinstall(boot, upgrader)
 	}
 
 	flistWatcher := upgrade.FListSemverWatcher{
@@ -275,6 +309,9 @@ func upgradeLoop(
 		Current:  boot.MustVersion(), //if we are here version must be valid
 		Duration: 600 * time.Second,
 	}
+
+	// make sure we push the current version to monitor
+	monitor.C <- boot.MustVersion()
 
 	flistEvents, err := flistWatcher.Watch(ctx)
 	if err != nil {
@@ -335,6 +372,7 @@ func upgradeLoop(
 				log.Error().Err(err).Msg("failed to update boot information")
 			}
 
+			monitor.C <- version
 			if err := backoff.RetryNotify(func() error {
 				return register(version.String())
 			}, backoff.NewExponentialBackOff(), retryNotify); err != nil {

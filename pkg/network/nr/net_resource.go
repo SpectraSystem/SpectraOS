@@ -2,13 +2,16 @@ package nr
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 
-	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
+	"github.com/threefoldtech/zos/pkg/network/macvlan"
+
+	"github.com/threefoldtech/zos/pkg/network/types"
 
 	mapset "github.com/deckarep/golang-set"
 
@@ -68,11 +71,30 @@ func (nr *NetResource) BridgeName() (string, error) {
 	return name, nil
 }
 
+// TapName returns the name of the tap device to create for the network resource
+// in the host network namespace
+func (nr *NetResource) TapName() (string, error) {
+	name := fmt.Sprintf("t-%s", nr.id)
+	if len(name) > 15 {
+		return "", errors.Errorf("tap name too long %s", name)
+	}
+	return name, nil
+}
+
 // Namespace returns the name of the network namespace to create for the network resource
 func (nr *NetResource) Namespace() (string, error) {
 	name := fmt.Sprintf("n-%s", nr.id)
 	if len(name) > 15 {
 		return "", errors.Errorf("network namespace too long %s", name)
+	}
+	return name, nil
+}
+
+// NRIface returns name of netresource local interface
+func (nr *NetResource) NRIface() (string, error) {
+	name := fmt.Sprintf("n-%s", nr.id)
+	if len(name) > 15 {
+		return "", errors.Errorf("NR interface name too long %s", name)
 	}
 	return name, nil
 }
@@ -97,7 +119,7 @@ func (nr *NetResource) Create(pubNS ns.NetNS) error {
 	if err := nr.createNetNS(); err != nil {
 		return err
 	}
-	if err := nr.createVethPair(); err != nil {
+	if err := nr.attachToNRBridge(); err != nil {
 		return err
 	}
 	if err := nr.createWireguard(pubNS); err != nil {
@@ -143,7 +165,7 @@ func (nr *NetResource) ConfigureWG(privateKey string) error {
 		return fmt.Errorf("network namespace %s does not exits", nsName)
 	}
 
-	var handler = func(_ ns.NetNS) error {
+	handler := func(_ ns.NetNS) error {
 
 		wgName, err := nr.WGName()
 		if err != nil {
@@ -197,7 +219,7 @@ func (nr *NetResource) ConfigureWG(privateKey string) error {
 
 		for _, route := range routes {
 			route.LinkIndex = wg.Attrs().Index
-			if err := netlink.RouteAdd(route); err != nil && !os.IsExist(err) {
+			if err := netlink.RouteAdd(&route); err != nil && !os.IsExist(err) {
 				log.Error().
 					Err(err).
 					Str("route", route.String()).
@@ -249,21 +271,27 @@ func (nr *NetResource) Delete() error {
 	return nil
 }
 
-func (nr *NetResource) routes() ([]*netlink.Route, error) {
-	routes := make([]*netlink.Route, 0, len(nr.resource.Peers)+1)
+func isSubnet(n types.IPNet) bool {
+	ones, bits := n.IPNet.Mask.Size()
+	return ones < bits
+}
 
-	wgIP := wgIP(&nr.resource.Subnet.IPNet)
+func (nr *NetResource) routes() ([]netlink.Route, error) {
+	routes := make([]netlink.Route, 0)
 
-	for _, peer := range nr.resource.Peers {
-		routes = append(routes, &netlink.Route{
-			Dst: &peer.Subnet.IPNet,
-			Gw:  wgIP.IP,
-		})
+	peers := nr.resource.Peers
+	for i := range peers {
+		wgip := wgIP(&peers[i].Subnet.IPNet)
+		for j := range peers[i].AllowedIPs {
+			if !isSubnet(peers[i].AllowedIPs[j]) {
+				continue
+			}
+			routes = append(routes, netlink.Route{
+				Dst: &peers[i].AllowedIPs[j].IPNet,
+				Gw:  wgip.IP,
+			})
+		}
 	}
-
-	routes = append(routes, &netlink.Route{
-		Dst: nr.ipRange,
-	})
 
 	return routes, nil
 }
@@ -308,17 +336,31 @@ func (nr *NetResource) createNetNS() error {
 	if err != nil {
 		return err
 	}
-	netNS.Close()
+	defer netNS.Close()
+	err = netNS.Do(func(_ ns.NetNS) error {
+		if _, err := sysctl.Sysctl("net.ipv6.conf.all.forwarding", "1"); err != nil {
+			return err
+		}
+		if err := ifaceutil.SetLoUp(); err != nil {
+			return err
+		}
+		return nil
+	})
 	return nil
 }
 
-// createVethPair creates a veth pair inside the namespace of the
-// network resource and sends one side back to the host namespace
-// the host side of the veth pair is attach to the bridge of the network resource
-func (nr *NetResource) createVethPair() error {
-
+// attachToNRBridge creates a macvlan interface in the NR namespace, and attaches
+// it to the NR bridge
+func (nr *NetResource) attachToNRBridge() error {
+	// are we really sure length is always <= 5 ?
 	nsName, err := nr.Namespace()
-	nrVethName := fmt.Sprintf("nr-%s", nr.id[:12])
+	if err != nil {
+		return err
+	}
+	nrIfaceName, err := nr.NRIface()
+	if err != nil {
+		return err
+	}
 
 	netNS, err := namespace.GetByName(nsName)
 	if err != nil {
@@ -331,81 +373,48 @@ func (nr *NetResource) createVethPair() error {
 		return err
 	}
 
-	brLink, err := bridge.Get(bridgeName)
-	if err != nil {
-		return fmt.Errorf("bridge %s does not exits", bridgeName)
+	if !ifaceutil.Exists(nrIfaceName, netNS) {
+		log.Debug().Str("create macvlan", nrIfaceName).Msg("attachNRToBridge")
+		if _, err := macvlan.Create(nrIfaceName, bridgeName, netNS); err != nil {
+			return err
+		}
 	}
 
-	exists := false
-	hostIface := ""
-	var handler = func(hostNS ns.NetNS) error {
-		if _, err := sysctl.Sysctl("net.ipv6.conf.all.forwarding", "1"); err != nil {
-			return err
-		}
-
-		if _, err := netlink.LinkByName(nrVethName); err == nil {
-			exists = true
-			return nil
-		}
-
-		if err := ifaceutil.SetLoUp(); err != nil {
-			return err
-		}
-
-		log.Info().
-			Str("namespace", nsName).
-			Str("veth", nrVethName).
-			Msg("Create veth pair in net namespace")
-
-		hostVeth, nrVeth, err := ip.SetupVeth(nrVethName, 1500, hostNS)
-		if err != nil {
-			return err
-		}
-		hostIface = hostVeth.Name
-
-		link, err := netlink.LinkByName(nrVeth.Name)
+	var handler = func(_ ns.NetNS) error {
+		link, err := netlink.LinkByName(nrIfaceName)
 		if err != nil {
 			return err
 		}
 
 		ipnet := nr.resource.Subnet
 		ipnet.IP[len(ipnet.IP)-1] = 0x01
-		log.Info().Str("addr", ipnet.String()).Msg("set address on veth interface")
+		log.Info().Str("addr", ipnet.String()).Msg("set address on macvlan interface")
 
 		addr := &netlink.Addr{IPNet: &ipnet.IPNet, Label: ""}
 		if err = netlink.AddrAdd(link, addr); err != nil && !os.IsExist(err) {
 			return err
 		}
 
-		return nil
-	}
-	if err := netNS.Do(handler); err != nil {
-		return err
-	}
+		ipv6 := convert4to6(nr.ID(), ipnet.IP)
+		addr = &netlink.Addr{IPNet: &net.IPNet{
+			IP:   ipv6,
+			Mask: net.CIDRMask(64, 128),
+		}}
+		if err = netlink.AddrAdd(link, addr); err != nil && !os.IsExist(err) {
+			return err
+		}
 
-	if exists {
-		return nil
-	}
+		addr = &netlink.Addr{IPNet: &net.IPNet{
+			IP:   net.ParseIP("fe80::1"),
+			Mask: net.CIDRMask(64, 128),
+		}}
+		if err = netlink.AddrAdd(link, addr); err != nil && !os.IsExist(err) {
+			return err
+		}
 
-	hostVeth, err := netlink.LinkByName(hostIface)
-	if err != nil {
-		return err
+		return netlink.LinkSetUp(link)
 	}
-
-	if _, err := sysctl.Sysctl(fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", hostVeth.Attrs().Name), "1"); err != nil {
-		return errors.Wrapf(err, "failed to disable ip6 on veth %s", hostVeth.Attrs().Name)
-	}
-
-	log.Info().
-		Str("net resource veth", nrVethName).
-		Str("host veth", hostIface).
-		Str("bridge", bridgeName).
-		Msg("attach veth to bridge")
-
-	if err := bridge.AttachNic(hostVeth, brLink); err != nil {
-		return errors.Wrapf(err, "failed to attach veth %s to bridge %s", nrVethName, bridgeName)
-	}
-	return nil
+	return netNS.Do(handler)
 }
 
 // createBridge creates a bridge in the host namespace
@@ -520,4 +529,14 @@ func (nr *NetResource) applyFirewall() error {
 	}
 
 	return nil
+}
+
+func convert4to6(netID string, ip net.IP) net.IP {
+	h := md5.New()
+	md5NetID := h.Sum([]byte(netID))
+
+	ipv6 := fmt.Sprintf("fd%x:%x%x:%x%x", md5NetID[0], md5NetID[1], md5NetID[2], md5NetID[3], md5NetID[4])
+	ipv6 = fmt.Sprintf("%s:%x::%x", ipv6, ip[14], ip[15])
+
+	return net.ParseIP(ipv6)
 }
