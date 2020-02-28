@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -18,8 +17,6 @@ import (
 
 	"github.com/threefoldtech/zos/pkg"
 )
-
-type hookType string
 
 var (
 	// ErrRestartNeeded is returned if upgraded requires a restart
@@ -137,6 +134,7 @@ func (u Upgrader) stopMultiple(timeout time.Duration, service ...string) error {
 	for len(services) > 0 {
 		var stopped []string
 		for service := range services {
+			log.Info().Str("service", service).Msg("check if service is stopped")
 			status, err := u.Zinit.Status(service)
 			if err != nil {
 				return err
@@ -169,7 +167,9 @@ func (u Upgrader) stopMultiple(timeout time.Duration, service ...string) error {
 		case <-deadline:
 			for service := range services {
 				log.Warn().Str("service", service).Msg("service didn't stop in time. use SIGKILL")
-				u.Zinit.Kill(service, syscall.SIGKILL)
+				if err := u.Zinit.Kill(service, zinit.SIGKILL); err != nil {
+					log.Error().Err(err).Msgf("failed to send SIGKILL to service %s", service)
+				}
 			}
 		case <-time.After(1 * time.Second):
 		}
@@ -358,7 +358,7 @@ func (u *Upgrader) applyUpgrade(from, to FListEvent) error {
 }
 
 func copyRecursive(source string, destination string, skip ...string) error {
-	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(source, func(path string, info os.FileInfo, _ error) error {
 		rel, err := filepath.Rel(source, path)
 		if err != nil {
 			return err

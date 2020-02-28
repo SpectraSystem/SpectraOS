@@ -20,6 +20,7 @@ func cmdsLive(c *cli.Context) error {
 		start    = c.Int("start")
 		end      = c.Int("end")
 		expired  = c.Bool("expired")
+		deleted  = c.Bool("deleted")
 	)
 
 	keypair, err := identity.LoadKeyPair(seedPath)
@@ -32,6 +33,7 @@ func cmdsLive(c *cli.Context) error {
 		start:    start,
 		end:      end,
 		expired:  expired,
+		deleted:  deleted,
 	}
 
 	cResults := s.Scrap(keypair.Identity())
@@ -90,7 +92,20 @@ func printResult(r res) {
 			panic(err)
 		}
 
-		fmt.Printf("\tnetwork ID: %s\n", data.NetID)
+		fmt.Printf("\tnetwork ID: %s\n", data.Name)
+
+	case provision.KubernetesReservation:
+		data := provision.Kubernetes{}
+		if err := json.Unmarshal(r.Data, &data); err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("\tip: %v", data.IP)
+		if data.MasterIPs == nil || len(data.MasterIPs) == 0 {
+			fmt.Print(" master\n")
+		} else {
+			fmt.Printf("\n")
+		}
 	}
 }
 
@@ -99,12 +114,14 @@ type scraper struct {
 	start    int
 	end      int
 	expired  bool
+	deleted  bool
 	wg       sync.WaitGroup
 }
 type job struct {
 	id      int
 	user    string
 	expired bool
+	deleted bool
 }
 type res struct {
 	provision.Reservation
@@ -155,7 +172,10 @@ func worker(wg *sync.WaitGroup, cIn <-chan job, cOut chan<- res) {
 			continue
 		}
 
-		if !job.expired && res.Expired() == true {
+		if !job.expired && res.Expired() {
+			continue
+		}
+		if !job.deleted && res.ToDelete {
 			continue
 		}
 		if res.User != job.user {

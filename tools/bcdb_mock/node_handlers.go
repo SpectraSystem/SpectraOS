@@ -125,9 +125,10 @@ func (s *nodeStore) cockpitListNodes(w http.ResponseWriter, r *http.Request) {
 
 func (s *nodeStore) registerCapacity(w http.ResponseWriter, r *http.Request) {
 	x := struct {
-		Capacity directory.TfgridNodeResourceAmount1 `json:"capacity,omitempty"`
-		DMI      dmi.DMI                             `json:"dmi,omitempty"`
-		Disks    capacity.Disks                      `json:"disks,omitempty"`
+		Capacity   directory.TfgridNodeResourceAmount1 `json:"capacity,omitempty"`
+		DMI        dmi.DMI                             `json:"dmi,omitempty"`
+		Disks      capacity.Disks                      `json:"disks,omitempty"`
+		Hypervisor []string                            `json:"hypervisor,omitempty"`
 	}{}
 
 	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
@@ -141,7 +142,7 @@ func (s *nodeStore) registerCapacity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.StoreProof(nodeID, x.DMI, x.Disks); err != nil {
+	if err := s.StoreProof(nodeID, x.DMI, x.Disks, x.Hypervisor); err != nil {
 		httpError(w, err, http.StatusNotFound)
 		return
 	}
@@ -157,7 +158,7 @@ func (s *nodeStore) registerIfaces(w http.ResponseWriter, r *http.Request) {
 
 	input := []*types.IfaceInfo{}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		log.Printf(err.Error())
+		log.Print(err.Error())
 		httpError(w, err, http.StatusBadRequest)
 		return
 	}
@@ -246,6 +247,36 @@ func (s *nodeStore) updateUptimeHandler(w http.ResponseWriter, r *http.Request) 
 	fmt.Printf("node uptime received %s %d\n", nodeID, input.Uptime)
 
 	if err := s.updateUptime(nodeID, int64(input.Uptime)); err != nil {
+		httpError(w, err, http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *nodeStore) updateUsedResources(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	u := struct {
+		SRU int64 `json:"sru,omitempty"`
+		HRU int64 `json:"hru,omitempty"`
+		MRU int64 `json:"mru,omitempty"`
+		CRU int64 `json:"cru,omitempty"`
+	}{}
+	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+		httpError(w, err, http.StatusBadRequest)
+		return
+	}
+
+	nodeID := mux.Vars(r)["node_id"]
+
+	usedRescources := directory.TfgridNodeResourceAmount1{
+		Cru: int64(u.CRU),
+		Sru: int64(u.SRU),
+		Hru: int64(u.HRU),
+		Mru: int64(u.MRU),
+	}
+
+	if err := s.updateReservedCapacity(nodeID, usedRescources); err != nil {
 		httpError(w, err, http.StatusNotFound)
 		return
 	}

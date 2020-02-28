@@ -73,7 +73,7 @@ func validateNetwork(n *pkg.Network) error {
 	}
 
 	if len(n.NetResources) < 1 {
-		return fmt.Errorf("Network needs at least one network resource")
+		return fmt.Errorf("network needs at least one network resource")
 	}
 
 	for _, nr := range n.NetResources {
@@ -101,7 +101,7 @@ func validateNR(nr pkg.NetResource) error {
 		return fmt.Errorf("network resource wireguard public key cannot empty")
 	}
 
-	if nr.WGListenPort <= 0 {
+	if nr.WGListenPort == 0 {
 		return fmt.Errorf("network resource wireguard listen port cannot empty")
 	}
 
@@ -129,7 +129,7 @@ func validatePeer(p pkg.Peer) error {
 	return nil
 }
 
-func (n *networker) Join(networkdID pkg.NetID, containerID string, addrs []string) (join pkg.Member, err error) {
+func (n *networker) Join(networkdID pkg.NetID, containerID string, addrs []string, publicIP6 bool) (join pkg.Member, err error) {
 	// TODO:
 	// 1- Make sure this network id is actually deployed
 	// 2- Create a new namespace, then create a veth pair inside this namespace
@@ -160,7 +160,26 @@ func (n *networker) Join(networkdID pkg.NetID, containerID string, addrs []strin
 		ips[i] = net.ParseIP(addr)
 	}
 
-	return netRes.Join(containerID, ips)
+	join, err = netRes.Join(containerID, ips, publicIP6)
+	if err != nil {
+		return join, errors.Wrap(err, "failed to load network resource")
+	}
+
+	if publicIP6 {
+		netNs, err := namespace.GetByName(join.Namespace)
+		if err != nil {
+			return join, errors.Wrap(err, "failed to found a valid network interface to use as parent for 0-db container")
+		}
+		defer netNs.Close()
+
+		hw := ifaceutil.HardwareAddrFromInputBytes([]byte(containerID))
+
+		if err = createMacVlan("pub", hw, netNs); err != nil {
+			return join, errors.Wrap(err, "failed to create public macvlan interface")
+		}
+	}
+
+	return join, nil
 }
 
 func (n *networker) Leave(networkdID pkg.NetID, containerID string) error {
@@ -199,32 +218,40 @@ func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
 	}
 	defer netNs.Close()
 
+	return netNSName, createMacVlan(ZDBIface, hw, netNs)
+}
+
+func createMacVlan(iface string, hw net.HardwareAddr, netNs ns.NetNS) error {
 	// find which interface to use as master for the macvlan
-	var pubIface string
+	var (
+		pubIface string
+		err      error
+	)
+
 	if namespace.Exists(types.PublicNamespace) {
 		pubIface, err = publicMasterIface()
 		if err != nil {
-			return "", errors.Wrap(err, "failed to retrieve the master interface name of the public interface")
+			return errors.Wrap(err, "failed to retrieve the master interface name of the public interface")
 		}
 	} else {
 		pubIface, err = ifaceutil.HostIPV6Iface()
 		if err != nil {
-			return "", errors.Wrap(err, "failed to found a valid network interface to use as parent for 0-db container")
+			return errors.Wrap(err, "failed to found a valid network interface to use as parent for 0-db container")
 		}
 	}
 
-	macVlan, err := macvlan.Create(ZDBIface, pubIface, netNs)
+	macVlan, err := macvlan.Create(iface, pubIface, netNs)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to create public mac vlan interface")
+		return errors.Wrap(err, "failed to create public mac vlan interface")
 	}
 
 	log.Debug().Str("HW", hw.String()).Str("macvlan", macVlan.Name).Msg("setting hw address on link")
 	// we don't set any route or ip
 	if err := macvlan.Install(macVlan, hw, []*net.IPNet{}, []*netlink.Route{}, netNs); err != nil {
-		return "", err
+		return err
 	}
 
-	return netNSName, nil
+	return nil
 }
 
 // SetupTap interface in the network resource. We only allow 1 tap interface to be
@@ -253,7 +280,7 @@ func (n *networker) SetupTap(networkID pkg.NetID) (string, error) {
 		return "", errors.Wrap(err, "could not get network namespace bridge")
 	}
 
-	tapIface, err := netRes.TapName()
+	tapIface, err := tapName(networkID)
 	if err != nil {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -267,23 +294,7 @@ func (n *networker) SetupTap(networkID pkg.NetID) (string, error) {
 func (n *networker) RemoveTap(networkID pkg.NetID) error {
 	log.Info().Str("network-id", string(networkID)).Msg("Removing tap interface")
 
-	network, err := n.networkOf(string(networkID))
-	if err != nil {
-		return errors.Wrapf(err, "couldn't load network with id (%s)", networkID)
-	}
-
-	nodeID := n.identity.NodeID().Identity()
-	localNR, err := ResourceByNodeID(nodeID, network.NetResources)
-	if err != nil {
-		return err
-	}
-
-	netRes, err := nr.New(networkID, localNR, &network.IPRange.IPNet)
-	if err != nil {
-		return errors.Wrap(err, "failed to load network resource")
-	}
-
-	tapIface, err := netRes.TapName()
+	tapIface, err := tapName(networkID)
 	if err != nil {
 		return errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -667,7 +678,7 @@ func (n *networker) monitorNS(ctx context.Context, name, link string) <-chan pkg
 }
 
 func (n *networker) DMZAddresses(ctx context.Context) <-chan pkg.NetlinkAddresses {
-	return n.monitorNS(ctx, ndmz.NetNSNDMZ, ndmz.PublicIfaceName)
+	return n.monitorNS(ctx, ndmz.NetNSNDMZ, ndmz.DMZPub4)
 }
 
 func (n *networker) PublicAddresses(ctx context.Context) <-chan pkg.NetlinkAddresses {
@@ -683,9 +694,9 @@ func (n *networker) ZOSAddresses(ctx context.Context) <-chan pkg.NetlinkAddresse
 		log.Fatal().Err(err).Msg("failed to listen to netlink address updates")
 	}
 
-	link, err := netlink.LinkByName(DefaultBridge)
+	link, err := netlink.LinkByName(types.DefaultBridge)
 	if err != nil {
-		log.Fatal().Err(err).Msgf("could not find the '%s' bridge", DefaultBridge)
+		log.Fatal().Err(err).Msgf("could not find the '%s' bridge", types.DefaultBridge)
 	}
 
 	get := func() pkg.NetlinkAddresses {
@@ -783,4 +794,13 @@ func ResourceByNodeID(nodeID string, resources []pkg.NetResource) (*pkg.NetResou
 		}
 	}
 	return nil, fmt.Errorf("not network resource for this node: %s", nodeID)
+}
+
+// tapName returns the name of the tap device for a network namespace
+func tapName(netID pkg.NetID) (string, error) {
+	name := fmt.Sprintf("t-%s", netID)
+	if len(name) > 15 {
+		return "", errors.Errorf("tap name too long %s", name)
+	}
+	return name, nil
 }

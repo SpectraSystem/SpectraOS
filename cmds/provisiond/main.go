@@ -105,7 +105,7 @@ func main() {
 		provision.NewDecommissionSource(localStore),
 	)
 
-	engine := provision.New(source, localStore, remoteStore)
+	engine := provision.New(nodeID.Identity(), source, localStore, remoteStore)
 	server.Register(zbus.ObjectID{Name: module, Version: "0.0.1"}, pkg.ProvisionMonitor(engine))
 
 	log.Info().
@@ -121,11 +121,13 @@ func main() {
 		if err := server.Run(ctx); err != nil && err != context.Canceled {
 			log.Fatal().Err(err).Msg("unexpected error")
 		}
+		log.Info().Msg("zbus server stopped")
 	}()
 
 	if err := engine.Run(ctx); err != nil {
 		log.Error().Err(err).Msg("unexpected error")
 	}
+	log.Info().Msg("provision engine stopped")
 }
 
 type store interface {
