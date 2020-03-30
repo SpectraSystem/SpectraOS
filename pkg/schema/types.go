@@ -59,10 +59,10 @@ func (d *Date) UnmarshalJSON(bytes []byte) error {
 	var in string
 	switch v := inI.(type) {
 	case int64:
-		d.Time = time.Unix(v, 0)
+		d.Time = time.Unix(v, 0).UTC()
 		return nil
 	case float64:
-		d.Time = time.Unix(int64(v), 0)
+		d.Time = time.Unix(int64(v), 0).UTC()
 		return nil
 	case string:
 		in = v
@@ -202,4 +202,55 @@ func (i IPRange) MarshalJSON() ([]byte, error) {
 
 func (i IPRange) String() string {
 	return i.IPNet.String()
+}
+
+// Email type
+type Email string
+
+var (
+	emailP = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
+)
+
+// UnmarshalText loads IPRange from string
+func (e *Email) UnmarshalText(text []byte) error {
+	v := string(text)
+	if v == "" {
+		return nil
+	}
+
+	if !emailP.MatchString(v) {
+		return fmt.Errorf("invalid email address: %s", v)
+	}
+
+	*e = Email(v)
+	return nil
+}
+
+// ID object id
+type ID int64
+
+// MacAddress type
+type MacAddress struct{ net.HardwareAddr }
+
+// MarshalText marshals MacAddress type to a string
+func (mac MacAddress) MarshalText() ([]byte, error) {
+	if mac.HardwareAddr == nil {
+		return nil, nil
+	} else if mac.HardwareAddr.String() == "" {
+		return nil, nil
+	}
+	return []byte(mac.HardwareAddr.String()), nil
+}
+
+// UnmarshalText loads a macaddress from a string
+func (mac *MacAddress) UnmarshalText(addr []byte) error {
+	if len(addr) == 0 {
+		return nil
+	}
+	addr, err := net.ParseMAC(string(addr))
+	if err != nil {
+		return err
+	}
+	mac.HardwareAddr = addr
+	return nil
 }

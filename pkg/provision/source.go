@@ -2,12 +2,16 @@ package provision
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/tools/client"
 )
 
 type pollSource struct {
@@ -31,6 +35,50 @@ type ReservationPoller interface {
 	// reservation.ID >= from. So a client to the Poll method should make
 	// sure to call it with the last (MAX) reservation ID he receieved.
 	Poll(nodeID pkg.Identifier, from uint64) ([]*Reservation, error)
+}
+
+type reservationPoller struct {
+	wl client.Workloads
+}
+
+// provisionOrder is used to sort the workload type
+// in the right order for provisiond
+var provisionOrder = map[ReservationType]int{
+	DebugReservation:      0,
+	NetworkReservation:    1,
+	ZDBReservation:        2,
+	VolumeReservation:     3,
+	ContainerReservation:  4,
+	KubernetesReservation: 5,
+}
+
+func (r *reservationPoller) Poll(nodeID pkg.Identifier, from uint64) ([]*Reservation, error) {
+	list, err := r.wl.Workloads(nodeID.Identity(), from)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*Reservation, 0, len(list))
+	for _, wl := range list {
+		r, err := WorkloadToProvisionType(wl)
+		if err != nil {
+			return nil, err
+		}
+
+		result = append(result, r)
+	}
+
+	// sorts the workloads in the oder they need to be processed by provisiond
+	sort.Slice(result, func(i int, j int) bool {
+		return provisionOrder[result[i].Type] < provisionOrder[result[j].Type]
+	})
+
+	return result, nil
+}
+
+// ReservationPollerFromWorkloads returns a reservation poller from client.Workloads
+func ReservationPollerFromWorkloads(wl client.Workloads) ReservationPoller {
+	return &reservationPoller{wl: wl}
 }
 
 // PollSource does a long poll on address to get new and to be deleted
@@ -57,14 +105,22 @@ func (s *pollSource) Reservations(ctx context.Context) <-chan *Reservation {
 		defer close(ch)
 		var next uint64
 		on := time.Now()
+		log.Info().Msg("Started polling for reservations")
 		for {
 			time.Sleep(time.Until(on))
 			on = time.Now().Add(s.maxSleep)
-			log.Debug().Uint64("next", next).Msg("Polling for reservations")
+			log.Info().Uint64("next", next).Msg("Polling for reservations")
 
 			res, err := s.store.Poll(pkg.StrIdentifier(s.nodeID), next)
 			if err != nil && err != ErrPollEOS {
-				log.Error().Err(err).Msg("failed to get reservation")
+				// if this is not a temporary error, then skip the reservation entirely
+				// and try to get the next one
+				if !isNetworkErr(err) {
+					log.Error().Err(err).Uint64("next", next).Msg("failed to get reservation")
+					next++
+				} else {
+					log.Error().Err(err).Uint64("next", next).Msg("failed to get reservation, retry same")
+				}
 				continue
 			}
 
@@ -124,7 +180,7 @@ func (s *decommissionSource) Reservations(ctx context.Context) <-chan *Reservati
 		for {
 			// <-time.After(time.Minute * 10) //TODO: make configuration ? default value ?
 			<-time.After(time.Second * 20) //TODO: make configuration ? default value ?
-			log.Info().Msg("check for expired reservation")
+			log.Debug().Msg("check for expired reservation")
 
 			reservations, err := s.store.GetExpired()
 			if err != nil {
@@ -191,4 +247,9 @@ func (s *combinedSource) Reservations(ctx context.Context) <-chan *Reservation {
 	}()
 
 	return out
+}
+
+func isNetworkErr(err error) bool {
+	var perr *net.OpError
+	return errors.As(err, &perr)
 }

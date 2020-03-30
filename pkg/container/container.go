@@ -19,12 +19,13 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/runtime/restart"
 	"github.com/google/shlex"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/container/logger"
+	"github.com/threefoldtech/zos/pkg/container/stats"
 )
 
 const (
@@ -173,9 +174,56 @@ func (c *containerModule) Run(ns string, data pkg.Container) (id pkg.ContainerID
 		return id, err
 	}
 
-	task, err := container.NewTask(ctx, cio.LogFile(path.Join(logs, fmt.Sprintf("%s.log", container.ID()))))
+	loggers := logger.NewLoggers()
+
+	// hardcode local logfile
+	filepath := path.Join(logs, fmt.Sprintf("%s.log", container.ID()))
+	fileout, fileerr, err := logger.NewFile(filepath, filepath)
 	if err != nil {
 		return id, err
+	}
+
+	loggers.Add(fileout, fileerr)
+
+	// set user defined endpoint logging
+	for _, l := range data.Logs {
+		switch l.Type {
+		case logger.RedisType:
+			lo, le, err := logger.NewRedis(l.Data.Stdout, l.Data.Stderr)
+
+			if err != nil {
+				log.Error().Err(err).Msg("redis logger")
+				continue
+			}
+
+			loggers.Add(lo, le)
+
+		default:
+			log.Error().Str("type", l.Type).Msg("invalid logging type requested")
+		}
+	}
+
+	task, err := container.NewTask(ctx, loggers.Log())
+	if err != nil {
+		return id, err
+	}
+
+	// set user defined endpoint stats
+	for _, l := range data.StatsAggregator {
+		switch l.Type {
+		case stats.RedisType:
+			s, err := stats.NewRedis(l.Data.Endpoint)
+
+			if err != nil {
+				log.Error().Err(err).Msg("redis stats")
+				continue
+			}
+
+			go stats.Monitor(c.containerd, ns, data.Name, s)
+
+		default:
+			log.Error().Str("type", l.Type).Msg("invalid stats type requested")
+		}
 	}
 
 	// call start on the task to execute the redis server

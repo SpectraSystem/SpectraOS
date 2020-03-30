@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -18,43 +19,43 @@ import (
 // Counter interface
 type Counter interface {
 	// Increment counter atomically by v
-	Increment(v int64) int64
+	Increment(v uint64) uint64
 	// Decrement counter atomically by v
-	Decrement(v int64) int64
+	Decrement(v uint64) uint64
 	// Current returns the current value
-	Current() int64
+	Current() uint64
 }
 
 type counterNop struct{}
 
-func (c *counterNop) Increment(v int64) int64 {
+func (c *counterNop) Increment(v uint64) uint64 {
 	return 0
 }
 
-func (c *counterNop) Decrement(v int64) int64 {
+func (c *counterNop) Decrement(v uint64) uint64 {
 	return 0
 }
 
-func (c *counterNop) Current() int64 {
+func (c *counterNop) Current() uint64 {
 	return 0
 }
 
 // counterImpl value for safe increment/decrement
-type counterImpl int64
+type counterImpl uint64
 
 // Increment counter atomically by one
-func (c *counterImpl) Increment(v int64) int64 {
-	return atomic.AddInt64((*int64)(c), v)
+func (c *counterImpl) Increment(v uint64) uint64 {
+	return atomic.AddUint64((*uint64)(c), v)
 }
 
 // Decrement counter atomically by one
-func (c *counterImpl) Decrement(v int64) int64 {
-	return atomic.AddInt64((*int64)(c), -v)
+func (c *counterImpl) Decrement(v uint64) uint64 {
+	return atomic.AddUint64((*uint64)(c), -v)
 }
 
 // Current returns the current value
-func (c *counterImpl) Current() int64 {
-	return atomic.LoadInt64((*int64)(c))
+func (c *counterImpl) Current() uint64 {
+	return atomic.LoadUint64((*uint64)(c))
 }
 
 type (
@@ -76,18 +77,21 @@ type (
 		vms        counterImpl
 		debugs     counterImpl
 
-		SRU counterImpl
-		HRU counterImpl
-		MRU counterImpl
-		CRU counterImpl
+		SRU counterImpl // SSD storage in bytes
+		HRU counterImpl // HDD storage in bytes
+		MRU counterImpl // Memory storage in bytes
+		CRU counterImpl // CPU count absolute
 	}
 )
 
 // NewFSStore creates a in memory reservation store
 func NewFSStore(root string) (*FSStore, error) {
+	store := &FSStore{
+		root: root,
+	}
 	if app.IsFirstBoot("provisiond") {
 		log.Info().Msg("first boot, empty reservation cache")
-		if err := os.RemoveAll(root); err != nil {
+		if err := store.removeAllButPersistent(root); err != nil {
 			return nil, err
 		}
 
@@ -102,11 +106,48 @@ func NewFSStore(root string) (*FSStore, error) {
 
 	log.Info().Msg("restart detected, keep reservation cache intact")
 
-	store := &FSStore{
-		root: root,
+	return store, store.sync()
+}
+
+//TODO: i think both sync and removeAllButPersistent can be merged into
+// one method because now it scans the same directory twice.
+func (s *FSStore) removeAllButPersistent(rootPath string) error {
+	// if rootPath is not present on the filesystem, return
+	_, err := os.Stat(rootPath)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
 	}
 
-	return store, store.sync()
+	err = filepath.Walk(rootPath, func(path string, info os.FileInfo, r error) error {
+		if r != nil {
+			return r
+		}
+		// if a file with size 0 is present we can assume its empty and remove it
+		if info.Size() == 0 {
+			log.Warn().Str("filename", info.Name()).Msg("cached reservation %d found, but file is empty, removing.")
+			return os.Remove(path)
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+		reservationType, err := s.getType(filepath.Base(path))
+		if err != nil {
+			return err
+		}
+		if reservationType != VolumeReservation && reservationType != ZDBReservation {
+			log.Info().Msgf("Removing %s from cache", path)
+			return os.Remove(path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Error().Msgf("error walking the path %q: %v\n", rootPath, err)
+		return err
+	}
+	return nil
 }
 
 func (s *FSStore) sync() error {
@@ -239,6 +280,14 @@ func (s *FSStore) GetExpired() ([]*Reservation, error) {
 			continue
 		}
 
+		// if the file is empty, remove it and return.
+		if info.Size() == 0 {
+			if info.Size() == 0 {
+				log.Warn().Str("filename", info.Name()).Msg("cached reservation %d found, but file is empty, removing.")
+				return nil, os.Remove(path.Join(s.root, info.Name()))
+			}
+		}
+
 		r, err := s.get(info.Name())
 		if err != nil {
 			return nil, err
@@ -260,6 +309,41 @@ func (s *FSStore) Get(id string) (*Reservation, error) {
 	defer s.RUnlock()
 
 	return s.get(id)
+}
+
+// getType retrieves a specific reservation's type using its ID
+// if returns a non nil error if the reservation is not present in the store
+func (s *FSStore) getType(id string) (ReservationType, error) {
+	res := struct {
+		Type ReservationType `json:"type"`
+	}{}
+	path := filepath.Join(s.root, id)
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return "", errors.Wrapf(err, "reservation %s not found", id)
+	} else if err != nil {
+		return "", err
+	}
+
+	defer f.Close()
+	reader, err := versioned.NewReader(f)
+	if versioned.IsNotVersioned(err) {
+		if _, err := f.Seek(0, 0); err != nil { // make sure to read from start
+			return "", err
+		}
+		reader = versioned.NewVersionedReader(versioned.MustParse("0.0.0"), f)
+	}
+
+	validV1 := versioned.MustParseRange(fmt.Sprintf("<=%s", reservationSchemaV1))
+
+	if validV1(reader.Version()) {
+		if err := json.NewDecoder(reader).Decode(&res); err != nil {
+			return "nil", err
+		}
+	} else {
+		return "", fmt.Errorf("unknown reservation object version (%s)", reader.Version())
+	}
+	return res.Type, nil
 }
 
 // Exists checks if the reservation ID is in the store

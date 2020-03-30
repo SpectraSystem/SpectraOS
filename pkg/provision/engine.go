@@ -2,12 +2,15 @@ package provision
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/stubs"
+	"github.com/threefoldtech/zos/tools/client"
+	"github.com/threefoldtech/zos/tools/explorer/models/generated/directory"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
@@ -26,8 +29,8 @@ type ReservationCache interface {
 // Feedbacker defines the method that needs to be implemented
 // to send the provision result to BCDB
 type Feedbacker interface {
-	Feedback(id string, r *Result) error
-	Deleted(id string) error
+	Feedback(nodeID string, r *Result) error
+	Deleted(nodeID, id string) error
 	UpdateReservedResources(nodeID string, c Counters) error
 }
 
@@ -35,7 +38,7 @@ type defaultEngine struct {
 	nodeID string
 	source ReservationSource
 	store  ReservationCache
-	fb     Feedbacker
+	cl     *client.Client
 }
 
 // New creates a new engine. Once started, the engine
@@ -44,12 +47,12 @@ type defaultEngine struct {
 // the default implementation is a single threaded worker. so it process
 // one reservation at a time. On error, the engine will log the error. and
 // continue to next reservation.
-func New(nodeID string, source ReservationSource, rw ReservationCache, fb Feedbacker) Engine {
+func New(nodeID string, source ReservationSource, rw ReservationCache, cl *client.Client) Engine {
 	return &defaultEngine{
 		nodeID: nodeID,
 		source: source,
 		store:  rw,
-		fb:     fb,
+		cl:     cl,
 	}
 }
 
@@ -74,14 +77,17 @@ func (e *defaultEngine) Run(ctx context.Context) error {
 				return nil
 			}
 
+			expired := reservation.Expired()
 			slog := log.With().
 				Str("id", string(reservation.ID)).
 				Str("type", string(reservation.Type)).
 				Str("duration", fmt.Sprintf("%v", reservation.Duration)).
 				Str("tag", reservation.Tag.String()).
+				Bool("to-delete", reservation.ToDelete).
+				Bool("expired", expired).
 				Logger()
 
-			if reservation.Expired() || reservation.ToDelete {
+			if expired || reservation.ToDelete {
 				slog.Info().Msg("start decommissioning reservation")
 				if err := e.decommission(ctx, reservation); err != nil {
 					log.Error().Err(err).Msgf("failed to decommission reservation %s", reservation.ID)
@@ -94,11 +100,40 @@ func (e *defaultEngine) Run(ctx context.Context) error {
 					continue
 				}
 			}
-			if err := e.fb.UpdateReservedResources(e.nodeID, e.store.Counters()); err != nil {
+
+			if err := e.updateReservedCapacity(); err != nil {
 				log.Error().Err(err).Msg("failed to updated the used resources")
 			}
 		}
 	}
+}
+
+func (e defaultEngine) capacityUsed() (directory.ResourceAmount, directory.WorkloadAmount) {
+	counters := e.store.Counters()
+
+	resources := directory.ResourceAmount{
+		Cru: counters.CRU.Current(),
+		Mru: float64(counters.MRU.Current()) / float64(gib),
+		Sru: float64(counters.SRU.Current()) / float64(gib),
+		Hru: float64(counters.HRU.Current()) / float64(gib),
+	}
+
+	workloads := directory.WorkloadAmount{
+		Volume:       uint16(counters.volumes.Current()),
+		Container:    uint16(counters.containers.Current()),
+		ZDBNamespace: uint16(counters.zdbs.Current()),
+		K8sVM:        uint16(counters.vms.Current()),
+		Network:      uint16(counters.networks.Current()),
+	}
+	return resources, workloads
+}
+
+func (e *defaultEngine) updateReservedCapacity() error {
+	resources, workloads := e.capacityUsed()
+	log.Info().Msgf("reserved resource %+v", resources)
+	log.Info().Msgf("provisionned workloads %+v", workloads)
+
+	return e.cl.Directory.NodeUpdateUsedResources(e.nodeID, resources, workloads)
 }
 
 func (e *defaultEngine) provision(ctx context.Context, r *Reservation) error {
@@ -147,7 +182,7 @@ func (e *defaultEngine) decommission(ctx context.Context, r *Reservation) error 
 
 	if !exists {
 		log.Info().Str("id", r.ID).Msg("reservation not provisioned, no need to decomission")
-		if err := e.fb.Deleted(r.ID); err != nil {
+		if err := e.cl.Workloads.WorkloadPutDeleted(e.nodeID, r.ID); err != nil {
 			log.Error().Err(err).Str("id", r.ID).Msg("failed to mark reservation as deleted")
 		}
 		return nil
@@ -162,7 +197,7 @@ func (e *defaultEngine) decommission(ctx context.Context, r *Reservation) error 
 		return errors.Wrapf(err, "failed to remove reservation %s from cache", r.ID)
 	}
 
-	if err := e.fb.Deleted(r.ID); err != nil {
+	if err := e.cl.Workloads.WorkloadPutDeleted(e.nodeID, r.ID); err != nil {
 		return errors.Wrap(err, "failed to mark reservation as deleted")
 	}
 
@@ -186,12 +221,12 @@ func (e *defaultEngine) reply(ctx context.Context, r *Reservation, rErr error, i
 			Str("id", r.ID).
 			Msgf("failed to apply provision")
 		result.Error = rErr.Error()
-		result.State = "error" //TODO: create enum
+		result.State = StateError
 	} else {
 		log.Info().
 			Str("result", fmt.Sprintf("%v", info)).
 			Msgf("workload deployed")
-		result.State = "ok"
+		result.State = StateOk
 	}
 
 	br, err := json.Marshal(info)
@@ -209,9 +244,9 @@ func (e *defaultEngine) reply(ctx context.Context, r *Reservation, rErr error, i
 	if err != nil {
 		return errors.Wrap(err, "failed to signed the result")
 	}
-	result.Signature = sig
+	result.Signature = hex.EncodeToString(sig)
 
-	return e.fb.Feedback(r.ID, result)
+	return e.cl.Workloads.WorkloadPutResult(e.nodeID, r.ID, result.ToSchemaType())
 }
 
 func (e *defaultEngine) Counters(ctx context.Context) <-chan pkg.ProvisionCounters {
@@ -225,11 +260,11 @@ func (e *defaultEngine) Counters(ctx context.Context) <-chan pkg.ProvisionCounte
 
 			c := e.store.Counters()
 			pc := pkg.ProvisionCounters{
-				Container: int64(c.containers),
-				Network:   int64(c.networks),
-				ZDB:       int64(c.zdbs),
-				Volume:    int64(c.volumes),
-				VM:        int64(c.vms),
+				Container: int64(c.containers.Current()),
+				Network:   int64(c.networks.Current()),
+				ZDB:       int64(c.zdbs.Current()),
+				Volume:    int64(c.volumes.Current()),
+				VM:        int64(c.vms.Current()),
 			}
 
 			select {

@@ -3,6 +3,11 @@ package pkg
 //go:generate mkdir -p stubs
 //go:generate zbusc -module container -version 0.0.1 -name container -package stubs github.com/threefoldtech/zos/pkg+ContainerModule stubs/container_stub.go
 
+import (
+	"github.com/threefoldtech/zos/pkg/container/logger"
+	"github.com/threefoldtech/zos/pkg/container/stats"
+)
+
 // ContainerID type
 type ContainerID string
 
@@ -46,6 +51,10 @@ type Container struct {
 	CPU uint
 	// Memory limit in bytes
 	Memory uint64
+	// Logs backends
+	Logs []logger.Logs
+	// StatsAggregator container metrics backend
+	StatsAggregator []stats.Aggregator
 }
 
 // ContainerModule defines rpc interface to containerd

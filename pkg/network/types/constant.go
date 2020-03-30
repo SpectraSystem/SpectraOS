@@ -1,1 +1,14 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/a4dd3668037b2a10529e2c5fde7f2e58
+package types
+
+const (
+	// PublicNamespace is the name of the public namespace of a node
+	// the public namespace is currently unique for a node so we hardcode its name
+	PublicNamespace = "public"
+	// PublicIface is the name of the interface we create in the public namespace
+	PublicIface = "public"
+	// GatewayNamespace is the name of the gateway namespace of a node
+	GatewayNamespace = "gateway"
+	// DefaultBridge is the name of the default bridge created
+	// by the bootstrap of networkd
+	DefaultBridge = "zos"
+)

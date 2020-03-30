@@ -10,19 +10,21 @@ import (
 
 	"github.com/cenkalti/backoff/v3"
 	"github.com/threefoldtech/zos/pkg"
-	"github.com/threefoldtech/zos/pkg/network"
 	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
 	"github.com/threefoldtech/zos/pkg/network/types"
+	"github.com/threefoldtech/zos/pkg/schema"
+	"github.com/threefoldtech/zos/tools/client"
+	"github.com/threefoldtech/zos/tools/explorer/models/generated/directory"
 	"github.com/vishvananda/netlink"
 )
 
 type WatchedLinks struct {
 	linkNames map[string]struct{}
-	bcdb      network.TNoDB
+	dir       client.Directory
 	nodeID    pkg.Identifier
 }
 
-func NewWatchedLinks(linkNames []string, nodeID pkg.Identifier, db network.TNoDB) WatchedLinks {
+func NewWatchedLinks(linkNames []string, nodeID pkg.Identifier, dir client.Directory) WatchedLinks {
 	names := make(map[string]struct{}, len(linkNames))
 
 	for _, n := range linkNames {
@@ -31,7 +33,7 @@ func NewWatchedLinks(linkNames []string, nodeID pkg.Identifier, db network.TNoDB
 
 	return WatchedLinks{
 		linkNames: names,
-		bcdb:      db,
+		dir:       dir,
 		nodeID:    nodeID,
 	}
 }
@@ -54,7 +56,7 @@ func (w WatchedLinks) callBack(update netlink.AddrUpdate) error {
 		return err
 	}
 
-	return publishIfaces(ifaces, w.nodeID, w.bcdb)
+	return publishIfaces(ifaces, w.nodeID, w.dir)
 }
 
 func (w WatchedLinks) Forever(ctx context.Context) error {
@@ -66,6 +68,8 @@ func (w WatchedLinks) Forever(ctx context.Context) error {
 	if err := netlink.AddrSubscribe(ch, done); err != nil {
 		return err
 	}
+
+	nextAllowed := time.Now()
 
 	for {
 		select {
@@ -79,9 +83,14 @@ func (w WatchedLinks) Forever(ctx context.Context) error {
 				return fmt.Errorf("netlink closed the subscription channel")
 			}
 
-			log.Debug().Msgf("addr update received %+v", update)
-			if err := w.callBack(update); err != nil {
-				log.Error().Err(err).Msg("addr watcher: error during callback")
+			now := time.Now()
+			if now.After(nextAllowed) {
+				log.Debug().Msgf("addr update received %+v", update)
+
+				if err := w.callBack(update); err != nil {
+					log.Error().Err(err).Msg("addr watcher: error during callback")
+				}
+				nextAllowed = now.Add(time.Minute * 10)
 			}
 		}
 	}
@@ -121,8 +130,9 @@ func getLocalInterfaces() ([]types.IfaceInfo, error) {
 		}
 
 		info := types.IfaceInfo{
-			Name:  link.Attrs().Name,
-			Addrs: make([]types.IPNet, len(addrs)),
+			Name:       link.Attrs().Name,
+			Addrs:      make([]types.IPNet, len(addrs)),
+			MacAddress: schema.MacAddress{link.Attrs().HardwareAddr},
 		}
 		for i, addr := range addrs {
 			info.Addrs[i] = types.NewIPNet(addr.IPNet)
@@ -138,10 +148,14 @@ func getLocalInterfaces() ([]types.IfaceInfo, error) {
 	return output, err
 }
 
-func publishIfaces(ifaces []types.IfaceInfo, id pkg.Identifier, db network.TNoDB) error {
+func publishIfaces(ifaces []types.IfaceInfo, id pkg.Identifier, db client.Directory) error {
 	f := func() error {
 		log.Info().Msg("try to publish interfaces to TNoDB")
-		return db.PublishInterfaces(id, ifaces)
+		var input []directory.Iface
+		for _, inf := range ifaces {
+			input = append(input, inf.ToSchema())
+		}
+		return db.NodeSetInterfaces(id.Identity(), input)
 	}
 	errHandler := func(err error, _ time.Duration) {
 		if err != nil {

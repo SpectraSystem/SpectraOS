@@ -7,14 +7,13 @@ import (
 
 	"github.com/cenkalti/backoff/v3"
 
-	"github.com/pkg/errors"
 	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/capacity"
-	"github.com/threefoldtech/zos/pkg/environment"
-	"github.com/threefoldtech/zos/pkg/gedis"
 	"github.com/threefoldtech/zos/pkg/monitord"
 	"github.com/threefoldtech/zos/pkg/stubs"
 	"github.com/threefoldtech/zos/pkg/utils"
+	"github.com/threefoldtech/zos/tools/client"
+	"github.com/threefoldtech/zos/tools/explorer/models/generated/directory"
 
 	"github.com/rs/zerolog/log"
 
@@ -27,10 +26,13 @@ const module = "monitor"
 func cap(ctx context.Context, client zbus.Client) {
 	storage := stubs.NewStorageModuleStub(client)
 	identity := stubs.NewIdentityManagerStub(client)
-	store, err := bcdbClient()
+	cl, err := bcdbClient()
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to bcdb backend")
 	}
+
+	// call this now so we block here until identityd is ready to serve us
+	nodeID := identity.NodeID().Identity()
 
 	r := capacity.NewResourceOracle(storage)
 
@@ -62,10 +64,25 @@ func cap(ctx context.Context, client zbus.Client) {
 		log.Fatal().Err(err).Msgf("failed to read virtualized state")
 	}
 
-	log.Info().Msg("sends capacity detail to BCDB")
-	if err := store.Register(identity.NodeID(), *resources, *dmi, disks, hypervisor); err != nil {
-		log.Fatal().Err(err).Msgf("failed to write resources capacity on BCDB")
+	ru := directory.ResourceAmount{
+		Cru: resources.CRU,
+		Mru: float64(resources.MRU),
+		Hru: float64(resources.HRU),
+		Sru: float64(resources.SRU),
 	}
+
+	setCapacity := func() error {
+		log.Info().Msg("sends capacity detail to BCDB")
+		return cl.NodeSetCapacity(nodeID, ru, *dmi, disks, hypervisor)
+	}
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxElapsedTime = 0 // retry forever
+	backoff.RetryNotify(setCapacity, bo, func(err error, d time.Duration) {
+		log.Error().
+			Err(err).
+			Str("sleep", d.String()).
+			Msgf("failed to write resources capacity on BCDB")
+	})
 
 	sendUptime := func() error {
 		uptime, err := r.Uptime()
@@ -75,7 +92,7 @@ func cap(ctx context.Context, client zbus.Client) {
 		}
 
 		log.Info().Msg("send heart-beat to BCDB")
-		if err := store.Ping(identity.NodeID(), uptime); err != nil {
+		if err := cl.NodeUpdateUptime(identity.NodeID().Identity(), uptime); err != nil {
 			log.Error().Err(err).Msgf("failed to send heart-beat to BCDB")
 			return err
 		}
@@ -155,22 +172,11 @@ func main() {
 }
 
 // instantiate the proper client based on the running mode
-func bcdbClient() (capacity.Store, error) {
-	env, err := environment.Get()
+func bcdbClient() (client.Directory, error) {
+	client, err := app.ExplorerClient()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse node environment")
+		return nil, err
 	}
 
-	// use the bcdb mock for dev and test
-	if env.RunningMode == environment.RunningDev {
-		return capacity.NewHTTPStore(env.BcdbURL), nil
-	}
-
-	// use gedis for production bcdb
-	store, err := gedis.New(env.BcdbURL, env.BcdbPassword)
-	if err != nil {
-		return nil, errors.Wrap(err, "fail to connect to BCDB")
-	}
-
-	return capacity.NewBCDBStore(store), nil
+	return client.Directory, nil
 }

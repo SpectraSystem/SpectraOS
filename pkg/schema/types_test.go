@@ -39,6 +39,48 @@ func TestParseDate(t *testing.T) {
 	}
 }
 
+func TestParseEmail(t *testing.T) {
+	cases := []struct {
+		Input  string
+		Output Email
+	}{
+		{`"azmy@gmail.com"`, Email("azmy@gmail.com")},
+		{`"a@b"`, Email("a@b")},
+		{`""`, Email("")},
+	}
+
+	for _, c := range cases {
+		t.Run(c.Input, func(t *testing.T) {
+			var d Email
+			err := json.Unmarshal([]byte(c.Input), &d)
+			if ok := assert.NoError(t, err); !ok {
+				t.Fatal()
+			}
+
+			if ok := assert.Equal(t, c.Output, d); !ok {
+				t.Error()
+			}
+		})
+	}
+
+	failed := []string{
+		`"gmail.com"`,
+		`"a"`,
+	}
+
+	for _, c := range failed {
+		t.Run(c, func(t *testing.T) {
+			var d Email
+			err := json.Unmarshal([]byte(c), &d)
+			if ok := assert.Error(t, err); !ok {
+				t.Fatal()
+			}
+
+		})
+	}
+
+}
+
 func TestNumericBigInt(t *testing.T) {
 	const inputValue = "1344719667586153181419716641724567886890850696275767987106294472017884974410332069524504824747437757"
 	var n Numeric
@@ -131,6 +173,81 @@ func TestDumpIPRange(t *testing.T) {
 		{IPRange{}, `""`},
 		{mustParse("192.168.1.0/24"), `"192.168.1.0/24"`},
 		{mustParse("2001:db8::/32"), `"2001:db8::/32"`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.Output, func(t *testing.T) {
+			out, err := json.Marshal(c.Input)
+			if ok := assert.NoError(t, err); !ok {
+				t.Fatal()
+			}
+
+			if ok := assert.Equal(t, c.Output, string(out)); !ok {
+				t.Error()
+			}
+		})
+	}
+}
+
+func TestParseMacAddress(t *testing.T) {
+	parser := func(t *testing.T, in string) MacAddress {
+		//note in is surrounded by "" because it's json
+		var str string
+		if err := json.Unmarshal([]byte(in), &str); err != nil {
+			t.Fatal(err)
+		}
+
+		if len(str) == 0 {
+			return MacAddress{}
+		}
+
+		mac, err := net.ParseMAC(str)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return MacAddress{mac}
+	}
+
+	cases := []struct {
+		Input  string
+		Output func(*testing.T, string) MacAddress
+	}{
+		{`"54:45:46:f6:02:61"`, parser},
+		{`"FF:FF:FF:FF:FF:FF"`, parser},
+		{`""`, parser},
+	}
+
+	for _, c := range cases {
+		t.Run(c.Input, func(t *testing.T) {
+			var d MacAddress
+			err := json.Unmarshal([]byte(c.Input), &d)
+			if ok := assert.NoError(t, err); !ok {
+				t.Fatal()
+			}
+
+			if ok := assert.Equal(t, c.Output(t, c.Input), d); !ok {
+				t.Error()
+			}
+		})
+	}
+}
+
+func TestDumpMacaddress(t *testing.T) {
+	mustParse := func(in string) MacAddress {
+		mac, err := net.ParseMAC(in)
+		if err != nil {
+			require.NoError(t, err)
+		}
+		return MacAddress{mac}
+	}
+
+	cases := []struct {
+		Input  MacAddress
+		Output string
+	}{
+		{MacAddress{}, `""`},
+		{mustParse("54:45:46:f6:02:61"), `"54:45:46:f6:02:61"`},
+		{mustParse("FF:FF:FF:FF:FF:FF"), `"ff:ff:ff:ff:ff:ff"`},
 	}
 
 	for _, c := range cases {

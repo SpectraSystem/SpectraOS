@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/stellar/go/xdr"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/crypto"
-	"github.com/threefoldtech/zos/pkg/identity"
 	"github.com/threefoldtech/zos/pkg/provision"
+	"github.com/threefoldtech/zos/pkg/schema"
+	"github.com/threefoldtech/zos/tools/client"
 
 	"github.com/urfave/cli"
 )
@@ -89,9 +92,10 @@ func cmdsProvision(c *cli.Context) error {
 	var (
 		schema   []byte
 		path     = c.String("schema")
-		nodeIDs  = c.StringSlice("node")
-		seedPath = c.String("seed")
+		seedPath = mainSeed
 		d        = c.String("duration")
+		assets   = c.StringSlice("asset")
+		userID   = int64(mainui.ThreebotID)
 		duration time.Duration
 		err      error
 	)
@@ -109,7 +113,7 @@ func cmdsProvision(c *cli.Context) error {
 		}
 	}
 
-	keypair, err := identity.LoadKeyPair(seedPath)
+	signer, err := client.NewSigner(mainui.Key().PrivateKey.Seed())
 	if err != nil {
 		return errors.Wrapf(err, "could not find seed file at %s", seedPath)
 	}
@@ -131,55 +135,121 @@ func cmdsProvision(c *cli.Context) error {
 	reservation.Duration = duration
 	reservation.Created = time.Now()
 	// set the user ID into the reservation schema
-	reservation.User = keypair.Identity()
+	//reservation.User = keypair.Identity()
 
-	for _, nodeID := range nodeIDs {
-		r := reservation //make a copy
-		r.NodeID = nodeID
-
-		custom, ok := provCustomModifiers[r.Type]
-		if ok {
-			if err := custom(&r); err != nil {
-				return err
-			}
+	custom, ok := provCustomModifiers[reservation.Type]
+	fmt.Println("customization: ", ok)
+	if ok {
+		fmt.Println("running customization function", reservation.NodeID)
+		if err := custom(&reservation); err != nil {
+			return err
 		}
+	}
 
-		if err := r.Sign(keypair.PrivateKey); err != nil {
-			return errors.Wrap(err, "failed to sign the reservation")
-		}
+	jsx, err := reservation.ToSchemaType()
+	if err != nil {
+		return errors.Wrap(err, "failed to convert reservation to schema type")
+	}
+	jsx.CustomerTid = userID
+	// we always allow user to delete his own reservations
+	jsx.DataReservation.SigningRequestDelete.QuorumMin = 1
+	jsx.DataReservation.SigningRequestDelete.Signers = []int64{userID}
 
-		id, err := client.Reserve(&r)
-		if err != nil {
-			return errors.Wrap(err, "failed to send reservation")
-		}
+	// set allowed the currencies as provided by the user
+	jsx.DataReservation.Currencies = assets
 
-		fmt.Printf("Reservation for %v send to node %s\n", duration, r.NodeID)
-		fmt.Printf("Resource: %v\n", id)
+	bytes, err := json.Marshal(jsx.DataReservation)
+	if err != nil {
+		return err
+	}
+
+	jsx.Json = string(bytes)
+	_, signature, err := signer.SignHex(jsx.Json)
+	if err != nil {
+		return errors.Wrap(err, "failed to sign the reservation")
+	}
+
+	jsx.CustomerSignature = signature
+
+	if c.Bool("dry-run") {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(jsx)
+	}
+
+	response, err := bcdb.Workloads.Create(jsx)
+	if err != nil {
+		return errors.Wrap(err, "failed to send reservation")
+	}
+
+	totalAmount := xdr.Int64(0)
+	for _, detail := range response.EscrowInformation.Details {
+		totalAmount += detail.TotalAmount
+	}
+
+	fmt.Printf("Reservation for %v send to node bcdb\n", duration)
+	fmt.Printf("Resource: /reservations/%v\n", response.ID)
+	fmt.Println()
+
+	fmt.Printf("Reservation id: %d \n", response.ID)
+	fmt.Printf("Asset to pay: %s\n", response.EscrowInformation.Asset)
+	fmt.Printf("Reservation escrow address: %s \n", response.EscrowInformation.Address)
+	fmt.Printf("Reservation amount: %s %s\n", formatCurrency(totalAmount), response.EscrowInformation.Asset.Code())
+
+	for _, detail := range response.EscrowInformation.Details {
+		fmt.Println()
+		fmt.Printf("FarmerID: %v\n", detail.FarmerID)
+		fmt.Printf("Amount: %s\n", formatCurrency(detail.TotalAmount))
 	}
 
 	return nil
 }
 
-func embed(schema interface{}, t provision.ReservationType) (*provision.Reservation, error) {
+func formatCurrency(amount xdr.Int64) string {
+	currency := big.NewRat(int64(amount), 1e7)
+	return currency.FloatString(7)
+}
+
+func embed(schema interface{}, t provision.ReservationType, node string) (*provision.Reservation, error) {
 	raw, err := json.Marshal(schema)
 	if err != nil {
 		return nil, err
 	}
-
 	r := &provision.Reservation{
-		Type: t,
-		Data: raw,
+		NodeID: node,
+		Type:   t,
+		Data:   raw,
 	}
 
 	return r, nil
 }
 
 func cmdsDeleteReservation(c *cli.Context) error {
-	id := c.String("id")
+	var (
+		resID  = c.Int64("reservation")
+		userID = mainui.ThreebotID
+		//seedPath = c.GlobalString("seed")
+	)
 
-	if err := client.Delete(id); err != nil {
-		return errors.Wrapf(err, "failed to mark reservation %s to be deleted", id)
+	reservation, err := bcdb.Workloads.Get(schema.ID(resID))
+	if err != nil {
+		return errors.Wrap(err, "failed to get reservation info")
 	}
-	fmt.Printf("Reservation %v marked as to be deleted\n", id)
+
+	signer, err := client.NewSigner(mainui.Key().PrivateKey.Seed())
+	if err != nil {
+		return errors.Wrapf(err, "failed to load signer")
+	}
+
+	_, signature, err := signer.SignHex(resID, reservation.Json)
+	if err != nil {
+		return errors.Wrap(err, "failed to sign the reservation")
+	}
+
+	if err := bcdb.Workloads.SignDelete(schema.ID(resID), schema.ID(userID), signature); err != nil {
+		return errors.Wrapf(err, "failed to sign deletion of reservation: %d", resID)
+	}
+
+	fmt.Printf("Reservation %v marked as to be deleted\n", resID)
 	return nil
 }

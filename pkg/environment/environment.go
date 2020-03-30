@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/pkg/errors"
 	"github.com/threefoldtech/zos/pkg"
 
 	"github.com/threefoldtech/zos/pkg/kernel"
@@ -56,14 +57,14 @@ const (
 var (
 	envDev = Environment{
 		RunningMode: RunningDev,
-		BcdbURL:     "https://explorer.devnet.grid.tf",
+		BcdbURL:     "https://explorer.devnet.grid.tf/explorer",
 		// ProvisionTimeout:  60,
 		// ProvisionInterval: 10,
 	}
 
 	envTest = Environment{
 		RunningMode: RunningTest,
-		BcdbURL:     "tcp://explorer.testnet.grid.tf:8901",
+		BcdbURL:     "https://explorer.testnet.grid.tf/explorer",
 		// ProvisionTimeout:  120,
 		// ProvisionInterval: 10,
 	}
@@ -71,7 +72,7 @@ var (
 	// same as testnet for now. will be updated the day of the launch of production network
 	envProd = Environment{
 		RunningMode: RunningMain,
-		BcdbURL:     "tcp://explorer.testnet.grid.tf:8901",
+		BcdbURL:     "https://explorer.grid.tf/explorer",
 		// ProvisionTimeout:  240,
 		// ProvisionInterval: 20,
 	}
@@ -130,7 +131,7 @@ func getEnvironmentFromParams(params kernel.Params) (Environment, error) {
 		env.Orphan = false
 		id, err := strconv.ParseUint(farmerID[0], 10, 64)
 		if err != nil {
-			return env, err
+			return env, errors.Wrap(err, "wrong format for farm ID")
 		}
 		env.FarmerID = pkg.FarmID(id)
 	}

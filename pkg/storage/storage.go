@@ -7,18 +7,21 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
+	log "github.com/rs/zerolog/log"
 	"github.com/shirou/gopsutil/disk"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/storage/filesystem"
 )
 
 const (
-	cacheTarget = "/var/cache"
+	// CacheTarget is the path where the cache disk is mounted
+	CacheTarget = "/var/cache"
 	cacheLabel  = "zos-cache"
 	cacheSize   = 20 * 1024 * 1024 * 1024 // 20GB
 )
@@ -114,6 +117,19 @@ func (s *storageModule) BrokenDevices() []pkg.BrokenDevice {
 	return s.brokenDevices
 }
 
+func (s *storageModule) Dump() {
+	log.Debug().Int("volumes", len(s.volumes)).Msg("dumping volumes")
+
+	for i := range s.volumes {
+		devices := s.volumes[i].Devices()
+		for id := range devices {
+			d := devices[id]
+			log.Debug().Str("path", d.Path).Str("label", d.Label).Str("type", string(d.DiskType)).Send()
+		}
+	}
+
+}
+
 /**
 initialize, must be called at least onetime each boot.
 What Initialize will do is the following:
@@ -169,9 +185,8 @@ func (s *storageModule) initialize(policy pkg.StoragePolicy) error {
 		return err
 	}
 
-	// collect free disks, sort by read time so faster disks are first
-	sort.Sort(filesystem.ByReadTime(disks))
 	freeDisks := filesystem.DeviceCache{}
+
 	for idx := range disks {
 		if !disks[idx].Used() {
 			log.Debug().Msgf("Found free device %s", disks[idx].Path)
@@ -179,7 +194,13 @@ func (s *storageModule) initialize(policy pkg.StoragePolicy) error {
 		}
 	}
 
-	log.Info().Msgf("Creating new volumes using policy %s", policy.Raid)
+	// sort by read time so faster disks are first
+	sort.Sort(filesystem.ByReadTime(freeDisks))
+
+	// dumping current s.volumes list
+	s.Dump()
+
+	log.Info().Msgf("Creating new volumes using policy: %s", policy.Raid)
 
 	// sanity check for disk amount
 	diskBase, exists := diskBase[policy.Raid]
@@ -217,7 +238,7 @@ func (s *storageModule) initialize(policy pkg.StoragePolicy) error {
 		log.Debug().Msgf("Creating %d new volumes", possiblePools)
 
 		for i := 0; i < possiblePools; i++ {
-			log.Debug().Msgf("Creating new volume %d", i)
+			log.Debug().Msgf("Creating new volume: %d", i)
 			poolDevices := []*filesystem.Device{}
 
 			for j := 0; j < int(policy.Disks); j++ {
@@ -227,6 +248,8 @@ func (s *storageModule) initialize(policy pkg.StoragePolicy) error {
 
 			pool, err := fs.Create(ctx, uuid.New().String(), policy.Raid, poolDevices...)
 			if err != nil {
+				log.Info().Err(err).Msg("create filesystem")
+
 				// Failure to create a filesystem -> disk is dead. It is possible
 				// that multiple devices are used to create a single pool, and only
 				// one devices is actuall broken. We should probably expand on
@@ -253,6 +276,10 @@ func (s *storageModule) initialize(policy pkg.StoragePolicy) error {
 			}
 			s.volumes = append(s.volumes, newPools[idx])
 		}
+	}
+
+	if err := filesystem.Partprobe(ctx); err != nil {
+		return err
 	}
 
 	return s.ensureCache()
@@ -340,7 +367,12 @@ func (s *storageModule) ensureCache() error {
 
 	var cacheFs filesystem.Volume
 
-	// check if we already have a cache
+	if filesystem.IsMountPoint(CacheTarget) {
+		log.Debug().Msgf("Cache partition already mounted in %s", CacheTarget)
+		return nil
+	}
+
+	// check if cache volume available
 	for idx := range s.volumes {
 		filesystems, err := s.volumes[idx].Volumes()
 		if err != nil {
@@ -361,23 +393,41 @@ func (s *storageModule) ensureCache() error {
 	if cacheFs == nil {
 		log.Debug().Msgf("No cache found, try to create new cache")
 
+		log.Debug().Msgf("Trying to create new cache on SSD")
 		fs, err := s.createSubvol(cacheSize, cacheLabel, pkg.SSDDevice)
-		if errors.Is(err, pkg.ErrNotEnoughSpace{}) {
-			// No space on SSD (probably no SSD in the node at all), try HDD
-			fs, err = s.createSubvol(cacheSize, cacheLabel, pkg.HDDDevice)
-		}
+
 		if err != nil {
-			return err
+			log.Warn().Err(err).Msg("failed to create new cache on SSD")
+		} else {
+			cacheFs = fs
 		}
-		cacheFs = fs
 	}
 
-	if !filesystem.IsMountPoint(cacheTarget) {
-		log.Debug().Msgf("Mounting cache partition in %s", cacheTarget)
-		return filesystem.BindMount(cacheFs, cacheTarget)
+	if cacheFs == nil {
+		log.Debug().Msgf("Trying to create new cache on HDD")
+		fs, err := s.createSubvol(cacheSize, cacheLabel, pkg.HDDDevice)
+
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to create new cache on HDD")
+		} else {
+			cacheFs = fs
+		}
 	}
-	log.Debug().Msgf("Cache partition already mounted in %s", cacheTarget)
-	return nil
+
+	if cacheFs == nil {
+		log.Warn().Msg("failed to create persisted cache disk. Running on limited cache")
+
+		// set limited cache flag
+		if err := app.SetFlag("limited-cache"); err != nil {
+			return err
+		}
+
+		// when everything failed, mount the Tmpfs
+		return syscall.Mount("", "/var/cache", "tmpfs", 0, "size=500M")
+	}
+
+	log.Debug().Msgf("Mounting cache partition in %s", CacheTarget)
+	return filesystem.BindMount(cacheFs, CacheTarget)
 }
 
 // createSubvol creates a subvolume with the given name and limits it to the given size

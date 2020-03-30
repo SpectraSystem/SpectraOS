@@ -26,10 +26,10 @@ func generateDebug(c *cli.Context) error {
 		Channel: c.String("channel"),
 	}
 
-	r, err := embed(s, provision.DebugReservation)
+	r, err := embed(s, provision.DebugReservation, c.String("node"))
 	if err != nil {
 		return err
 	}
 
-	return output(c.GlobalString("output"), r)
+	return writeWorkload(c.GlobalString("output"), r)
 }

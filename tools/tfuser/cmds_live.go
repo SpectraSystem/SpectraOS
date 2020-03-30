@@ -3,30 +3,26 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"sync"
+	"time"
 
-	"github.com/pkg/errors"
-	"github.com/threefoldtech/zos/pkg"
-	"github.com/threefoldtech/zos/pkg/identity"
-	"github.com/threefoldtech/zos/pkg/provision"
+	"github.com/rs/zerolog/log"
+	"github.com/threefoldtech/zos/tools/explorer/models/generated/workloads"
+	"gopkg.in/yaml.v2"
+
+	"github.com/threefoldtech/zos/pkg/schema"
 	"github.com/urfave/cli"
 )
 
 func cmdsLive(c *cli.Context) error {
 	var (
-		seedPath = c.String("seed")
-		start    = c.Int("start")
-		end      = c.Int("end")
-		expired  = c.Bool("expired")
-		deleted  = c.Bool("deleted")
+		userID  = int64(mainui.ThreebotID)
+		start   = c.Int("start")
+		end     = c.Int("end")
+		expired = c.Bool("expired")
+		deleted = c.Bool("deleted")
 	)
-
-	keypair, err := identity.LoadKeyPair(seedPath)
-	if err != nil {
-		return errors.Wrapf(err, "could not find seed file at %s", seedPath)
-	}
 
 	s := scraper{
 		poolSize: 10,
@@ -35,78 +31,120 @@ func cmdsLive(c *cli.Context) error {
 		expired:  expired,
 		deleted:  deleted,
 	}
-
-	cResults := s.Scrap(keypair.Identity())
+	cResults := s.Scrap(userID)
 	for result := range cResults {
 		printResult(result)
 	}
 	return nil
 }
 
+type m map[string]interface{}
+
 const timeLayout = "02-Jan-2006 15:04:05"
 
-func printResult(r res) {
-	expire := r.Created.Add(r.Duration)
-	fmt.Printf("ID:%6s Type:%10s expired at:%20s", r.ID, r.Type, expire.Format(timeLayout))
-	if r.Result == nil {
-		fmt.Printf("state: not deployed yet\n")
-		return
+func printResult(r workloads.Reservation) {
+	expire := r.DataReservation.ExpirationReservation
+	output := m{}
+	fmt.Printf("ID: %d Expires: %s\n", r.ID, expire.Format(timeLayout))
+
+	resultPerID := make(map[int64][]workloads.Result, len(r.Results))
+	for _, r := range r.Results {
+		var (
+			rid int64
+			wid int64
+		)
+		fmt.Sscanf(r.WorkloadId, "%d-%d", &rid, &wid)
+		results := resultPerID[wid]
+		results = append(results, r)
+
+		resultPerID[wid] = results
 	}
-	fmt.Printf("state: %6s", r.Result.State)
-	if r.Result.State == "error" {
-		fmt.Printf("\t%s\n", r.Result.Error)
-		return
+
+	resultData := func(in json.RawMessage) m {
+		var o m
+		if err := json.Unmarshal(in, &o); err != nil {
+			panic("invalid json")
+		}
+		return o
 	}
 
-	switch r.Type {
-	case provision.VolumeReservation:
-		rData := provision.VolumeResult{}
-		data := provision.Volume{}
-		if err := json.Unmarshal(r.Data, &data); err != nil {
-			panic(err)
+	allResults := func(in []workloads.Result) []m {
+		var o []m
+		for _, i := range in {
+			r := resultData(i.DataJson)
+			r["node"] = i.NodeId
+			r["state"] = i.State.String()
+			o = append(o, r)
 		}
-		if err := json.Unmarshal(r.Result.Data, &rData); err != nil {
-			panic(err)
-		}
-		fmt.Printf("\tVolume ID: %s Size: %d Type: %s\n", rData.ID, data.Size, data.Type)
-	case provision.ZDBReservation:
-		data := provision.ZDBResult{}
-		if err := json.Unmarshal(r.Result.Data, &data); err != nil {
-			panic(err)
-		}
-		fmt.Printf("\tAddr %s:%d Namespace %s\n", data.IP, data.Port, data.Namespace)
-
-	case provision.ContainerReservation:
-		data := provision.Container{}
-		if err := json.Unmarshal(r.Data, &data); err != nil {
-			panic(err)
-		}
-		fmt.Printf("\tflist: %s", data.FList)
-		for _, ip := range data.Network.IPs {
-			fmt.Printf("\tIP: %s", ip)
-		}
-		fmt.Printf("\n")
-	case provision.NetworkReservation:
-		data := pkg.Network{}
-		if err := json.Unmarshal(r.Data, &data); err != nil {
-			panic(err)
-		}
-
-		fmt.Printf("\tnetwork ID: %s\n", data.Name)
-
-	case provision.KubernetesReservation:
-		data := provision.Kubernetes{}
-		if err := json.Unmarshal(r.Data, &data); err != nil {
-			panic(err)
-		}
-
-		fmt.Printf("\tip: %v", data.IP)
-		if data.MasterIPs == nil || len(data.MasterIPs) == 0 {
-			fmt.Print(" master\n")
-		} else {
-			fmt.Printf("\n")
-		}
+		return o
 	}
+
+	for _, n := range r.DataReservation.Networks {
+		d := m{
+			"kind":    "network",
+			"name":    n.Name,
+			"results": allResults(resultPerID[n.WorkloadId]),
+		}
+
+		output[fmt.Sprintf("Workload %d", n.WorkloadId)] = d
+	}
+
+	for _, c := range r.DataReservation.Containers {
+		var ips []string
+		for _, ip := range c.NetworkConnection {
+			ips = append(ips, ip.Ipaddress.String())
+		}
+
+		d := m{
+			"kind":    "container",
+			"flist":   c.Flist,
+			"ip":      ips,
+			"results": allResults(resultPerID[c.WorkloadId]),
+		}
+
+		output[fmt.Sprintf("Workload %d", c.WorkloadId)] = d
+	}
+
+	for _, v := range r.DataReservation.Volumes {
+		d := m{
+			"kind":    "volume",
+			"size":    v.Size,
+			"type":    v.Type.String(),
+			"results": allResults(resultPerID[v.WorkloadId]),
+		}
+
+		output[fmt.Sprintf("Workload %d", v.WorkloadId)] = d
+
+	}
+
+	for _, z := range r.DataReservation.Zdbs {
+		d := m{
+			"kind":    "zdb",
+			"size":    z.Size,
+			"mode":    z.Mode.String(),
+			"results": allResults(resultPerID[z.WorkloadId]),
+		}
+
+		output[fmt.Sprintf("Workload %d", z.WorkloadId)] = d
+	}
+
+	for _, k := range r.DataReservation.Kubernetes {
+		d := m{
+			"kind":    "kubernetes",
+			"size":    k.Size,
+			"network": k.NetworkId,
+			"ip":      k.MasterIps,
+			"results": allResults(resultPerID[k.WorkloadId]),
+		}
+
+		output[fmt.Sprintf("Workload %d", k.WorkloadId)] = d
+	}
+
+	if err := yaml.NewEncoder(os.Stdout).Encode(output); err != nil {
+		log.Error().Err(err).Msg("failed to print result")
+	}
+
+	fmt.Println("-------------------------")
 }
 
 type scraper struct {
@@ -119,20 +157,16 @@ type scraper struct {
 }
 type job struct {
 	id      int
-	user    string
+	user    int64
 	expired bool
 	deleted bool
 }
-type res struct {
-	provision.Reservation
-	Result *provision.Result `json:"result"`
-}
 
-func (s *scraper) Scrap(user string) chan res {
+func (s *scraper) Scrap(user int64) chan workloads.Reservation {
 
 	var (
 		cIn  = make(chan job)
-		cOut = make(chan res)
+		cOut = make(chan workloads.Reservation)
 	)
 
 	s.wg.Add(s.poolSize)
@@ -161,10 +195,12 @@ func (s *scraper) Scrap(user string) chan res {
 	return cOut
 }
 
-func worker(wg *sync.WaitGroup, cIn <-chan job, cOut chan<- res) {
+func worker(wg *sync.WaitGroup, cIn <-chan job, cOut chan<- workloads.Reservation) {
 	defer func() {
 		wg.Done()
 	}()
+
+	now := time.Now()
 
 	for job := range cIn {
 		res, err := getResult(job.id)
@@ -172,40 +208,22 @@ func worker(wg *sync.WaitGroup, cIn <-chan job, cOut chan<- res) {
 			continue
 		}
 
-		if !job.expired && res.Expired() {
+		expired := now.After(res.DataReservation.ExpirationReservation.Time)
+
+		if !job.expired && expired {
 			continue
 		}
-		if !job.deleted && res.ToDelete {
+		// FIXME: beurk
+		if !job.deleted && len(res.Results) > 0 && res.Results[0].State == workloads.ResultStateDeleted {
 			continue
 		}
-		if res.User != job.user {
+		if res.CustomerTid != job.user {
 			continue
 		}
 		cOut <- res
 	}
 }
 
-func getResult(id int) (res, error) {
-	url := fmt.Sprintf("https://explorer.devnet.grid.tf/reservations/%d-1", id)
-	resp, err := http.Get(url)
-	if err != nil {
-		return res{}, err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return res{}, os.ErrNotExist
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return res{}, fmt.Errorf("wrong status code %s", resp.Status)
-	}
-
-	b := res{}
-	if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
-		return res{}, err
-	}
-
-	return b, nil
+func getResult(id int) (res workloads.Reservation, err error) {
+	return bcdb.Workloads.Get(schema.ID(id))
 }

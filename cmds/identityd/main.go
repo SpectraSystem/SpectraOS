@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
@@ -9,13 +10,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jbenet/go-base58"
+
 	"github.com/pkg/errors"
 	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/flist"
-	"github.com/threefoldtech/zos/pkg/gedis"
 	"github.com/threefoldtech/zos/pkg/geoip"
+	"github.com/threefoldtech/zos/pkg/network"
 	"github.com/threefoldtech/zos/pkg/stubs"
 	"github.com/threefoldtech/zos/pkg/upgrade"
+	"github.com/threefoldtech/zos/tools/client"
+	"github.com/threefoldtech/zos/tools/explorer/models/generated/directory"
 
 	"github.com/cenkalti/backoff/v3"
 	"github.com/threefoldtech/zos/pkg"
@@ -437,32 +442,41 @@ func identityMgr(root string) (pkg.IdentityManager, error) {
 }
 
 // instantiate the proper client based on the running mode
-func bcdbClient() (identity.IDStore, error) {
-	env, err := environment.Get()
+func bcdbClient() (client.Directory, error) {
+	client, err := app.ExplorerClient()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse node environment")
+		return nil, err
 	}
 
-	// use the bcdb mock for dev and test
-	if env.RunningMode == environment.RunningDev {
-		return identity.NewHTTPIDStore(env.BcdbURL), nil
-	}
-
-	// use gedis for production bcdb
-	store, err := gedis.New(env.BcdbURL, env.BcdbPassword)
-	if err != nil {
-		return nil, errors.Wrap(err, "fail to connect to BCDB")
-	}
-	return store, nil
+	return client.Directory, nil
 }
 
-func registerNode(nodeID pkg.Identifier, farmID pkg.FarmID, version string, store identity.IDStore, loc geoip.Location) error {
+func registerNode(nodeID pkg.Identifier, farmID pkg.FarmID, version string, store client.Directory, loc geoip.Location) error {
 	log.Info().Str("version", version).Msg("start registration of the node")
 
-	_, err := store.RegisterNode(nodeID, farmID, version, loc)
+	v1ID, _ := network.NodeIDv1()
+
+	publicKeyHex := hex.EncodeToString(base58.Decode(nodeID.Identity()))
+
+	err := store.NodeRegister(directory.Node{
+		NodeId:    nodeID.Identity(),
+		NodeIdV1:  v1ID,
+		FarmId:    int64(farmID),
+		OsVersion: version,
+		Location: directory.Location{
+			Continent: loc.Continent,
+			Country:   loc.Country,
+			City:      loc.City,
+			Longitude: loc.Longitute,
+			Latitude:  loc.Latitude,
+		},
+		PublicKeyHex: publicKeyHex,
+	})
+
 	if err != nil {
 		log.Error().Err(err).Send()
 		return err
 	}
+
 	return nil
 }

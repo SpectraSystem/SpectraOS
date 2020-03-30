@@ -143,6 +143,13 @@ func (l *lsblkDeviceManager) Raw(ctx context.Context) (DeviceCache, error) {
 		BlockDevices []Device `json:"blockdevices"`
 	}
 
+	// skipping unmarshal when lsblk response is empty
+	if len(bytes) == 0 {
+		log.Warn().Msg("no disks found on the system")
+		return DeviceCache(devices.BlockDevices), nil
+	}
+
+	// parsing lsblk response
 	if err := json.Unmarshal(bytes, &devices); err != nil {
 		return nil, err
 	}
@@ -184,6 +191,8 @@ func (l *lsblkDeviceManager) seektime(ctx context.Context, path string) (string,
 	}
 
 	err = json.Unmarshal(bytes, &seekTime)
+	log.Debug().Str("disk", path).Str("type", seekTime.Typ).Uint64("time", seekTime.Time).Msg("seektime")
+
 	return seekTime.Typ, seekTime.Time, err
 }
 
