@@ -1,1 +1,30 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/4cdd18c3c2d8bb3a2d88620d655118c4
+package main
+
+import (
+	"fmt"
+	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/storage"
+)
+
+func main() {
+	s, err := storage.New()
+	if err != nil {
+		panic(fmt.Sprintf("%v", err))
+	}
+
+	kind := pkg.SSDDevice
+	total, err := s.Total(kind)
+	if err != nil {
+		panic(fmt.Sprintf("%v", err))
+	}
+
+	fmt.Printf("SSD: %v\n", total)
+
+	kind = pkg.HDDDevice
+	total, err = s.Total(kind)
+	if err != nil {
+		panic(fmt.Sprintf("%v", err))
+	}
+
+	fmt.Printf("HDD: %v\n", total)
+}
