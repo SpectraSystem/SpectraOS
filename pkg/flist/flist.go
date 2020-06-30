@@ -21,11 +21,11 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/environment"
 )
 
 const (
-	defaultStorage = "zdb://hub.grid.tf:9900"
-	defaultRoot    = "/var/cache/modules/flist"
+	defaultRoot = "/var/cache/modules/flist"
 )
 
 const mib = 1024 * 1024
@@ -165,8 +165,13 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		return "", err
 	}
 
+	env, err := environment.Get()
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse node environment")
+	}
+
 	if storage == "" {
-		storage = defaultStorage
+		storage = env.FlistURL
 	}
 
 	flistPath, err := f.downloadFlist(url)
@@ -183,6 +188,11 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		if err != nil {
 			sublog.Info().Msgf("create new subvolume %s", name)
 			// and only create a new one if it doesn't exist
+			if opts.Limit == 0 || len(opts.Type) == 0 {
+				// sanity check in case type is not set always use hdd
+				return "", fmt.Errorf("invalid mount option, missing disk type and/or size")
+			}
+
 			path, err = f.storage.CreateFilesystem(name, opts.Limit*mib, opts.Type)
 			if err != nil {
 				return "", errors.Wrap(err, "failed to create read-write subvolume for 0-fs")
@@ -257,6 +267,26 @@ func (f *flistModule) getMountOptions(pidPath string) (options, error) {
 	return result, nil
 }
 
+func (f *flistModule) HashFromRootPath(name string) (string, error) {
+	base := filepath.Base(name)
+	pidPath := filepath.Join(f.pid, base) + ".pid"
+
+	opts, err := f.getMountOptions(pidPath)
+	if err != nil {
+		return "", err
+	}
+
+	for _, opt := range opts {
+		// if option start with the flist meta path
+		if strings.HasPrefix(opt, f.flist) {
+			// extracting hash (dirname) from argument
+			return filepath.Base(opt), nil
+		}
+	}
+
+	return "", fmt.Errorf("could not find rootfs hash name")
+}
+
 // NamedUmount implements the Flister.NamedUmount interface
 func (f *flistModule) NamedUmount(name string) error {
 	return f.Umount(filepath.Join(f.mountpoint, name))
@@ -320,11 +350,8 @@ func (f *flistModule) Umount(path string) error {
 	return nil
 }
 
-// downloadFlist downloads an flits from a URL
-// if the flist location also provide and md5 hash of the flist
-// this function will use it to avoid downloading an flist that is
-// already present locally
-func (f *flistModule) downloadFlist(url string) (string, error) {
+// FlistHash returns md5 of flist if available (requesting the hub)
+func (f *flistModule) FlistHash(url string) (string, error) {
 	// first check if the md5 of the flist is available
 	md5URL := url + ".md5"
 	resp, err := http.Get(md5URL)
@@ -339,6 +366,21 @@ func (f *flistModule) downloadFlist(url string) (string, error) {
 			return "", err
 		}
 
+		cleanhash := strings.TrimSpace(string(hash))
+		return cleanhash, nil
+	}
+
+	return "", fmt.Errorf("fail to fetch hash, response: %v", resp.StatusCode)
+}
+
+// downloadFlist downloads an flits from a URL
+// if the flist location also provide and md5 hash of the flist
+// this function will use it to avoid downloading an flist that is
+// already present locally
+func (f *flistModule) downloadFlist(url string) (string, error) {
+	// first check if the md5 of the flist is available
+	hash, err := f.FlistHash(url)
+	if err == nil {
 		flistPath := filepath.Join(f.flist, strings.TrimSpace(string(hash)))
 		_, err = os.Stat(flistPath)
 		if err != nil && !os.IsNotExist(err) {
@@ -353,7 +395,7 @@ func (f *flistModule) downloadFlist(url string) (string, error) {
 
 	log.Info().Str("url", url).Msg("flist not in cache, downloading")
 	// we don't have the flist locally yet, let's download it
-	resp, err = http.Get(url)
+	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
 	}
