@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,6 +53,7 @@ type flistModule struct {
 	mountpoint string
 	pid        string
 	log        string
+	run        string
 
 	storage   pkg.VolumeAllocater
 	commander commander
@@ -72,7 +74,7 @@ func newFlister(root string, storage pkg.VolumeAllocater, commander commander) p
 	}
 
 	// prepare directory layout for the module
-	for _, path := range []string{"flist", "cache", "mountpoint", "pid", "log"} {
+	for _, path := range []string{"flist", "cache", "mountpoint", "pid", "log", "run"} {
 		p := filepath.Join(root, path)
 		if err := os.MkdirAll(p, 0755); err != nil {
 			panic(err)
@@ -90,6 +92,7 @@ func newFlister(root string, storage pkg.VolumeAllocater, commander commander) p
 		mountpoint: filepath.Join(root, "mountpoint"),
 		pid:        filepath.Join(root, "pid"),
 		log:        filepath.Join(root, "log"),
+		run:        filepath.Join(root, "run"),
 
 		storage:   storage,
 		commander: commander,
@@ -169,6 +172,15 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		return "", err
 	}
 
+	err = f.valid(mountpoint)
+	if errors.Is(err, ErrAlreadyMounted) {
+		// if everything is already in place, just early return
+		log.Info().Msgf("flist is already mounted at %s, nothing more to do", mountpoint)
+		return mountpoint, nil
+	} else if err != nil {
+		return "", err
+	}
+
 	env, err := environment.Get()
 	if err != nil {
 		return "", errors.Wrap(err, "failed to parse node environment")
@@ -184,11 +196,13 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		return "", err
 	}
 
+	var backend string
+	var newAllocation bool
 	var args []string
 	if !opts.ReadOnly {
 		sublog.Info().Msgf("check if subvolume %s already exists", name)
 		// check if the filesystem doesn't already exists
-		path, err := f.storage.Path(name)
+		backend, err = f.storage.Path(name)
 		if err != nil {
 			sublog.Info().Msgf("create new subvolume %s", name)
 			// and only create a new one if it doesn't exist
@@ -196,30 +210,32 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 				// sanity check in case type is not set always use hdd
 				return "", fmt.Errorf("invalid mount option, missing disk type and/or size")
 			}
-
-			path, err = f.storage.CreateFilesystem(name, opts.Limit*mib, opts.Type)
+			newAllocation = true
+			backend, err = f.storage.CreateFilesystem(name, opts.Limit*mib, opts.Type)
 			if err != nil {
 				return "", errors.Wrap(err, "failed to create read-write subvolume for 0-fs")
 			}
 		}
-
-		args = append(args, "-backend", path)
-	} else {
-		args = append(args, "-ro")
 	}
 
-	err = f.valid(mountpoint)
-	if errors.Is(err, ErrAlreadyMounted) {
-		// if everything is already in place, just early return
-		log.Info().Msgf("flist is already mounted at %s, nothing more to do", mountpoint)
-		return mountpoint, nil
+	if len(backend) != 0 {
+		args = append(args, "-backend", backend)
+		// in case of an error (mount is never fully completed)
+		// we need to deallocate the filesystem
+		defer func() {
+			if newAllocation && err != nil {
+				f.storage.ReleaseFilesystem(name)
+			}
+		}()
+	} else {
+		args = append(args, "-ro")
 	}
 
 	if err != nil {
 		return "", errors.Wrap(err, "invalid mount point")
 	}
 
-	if err := os.MkdirAll(mountpoint, 0755); err != nil {
+	if err = os.MkdirAll(mountpoint, 0755); err != nil {
 		return "", err
 	}
 	pidPath := filepath.Join(f.pid, name) + ".pid"
@@ -237,7 +253,8 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 	sublog.Info().Strs("args", args).Msg("starting 0-fs daemon")
 	cmd := f.commander.Command("g8ufs", args...)
 
-	if out, err := cmd.CombinedOutput(); err != nil {
+	var out []byte
+	if out, err = cmd.CombinedOutput(); err != nil {
 		sublog.Err(err).Str("out", string(out)).Msg("fail to start 0-fs daemon")
 		return "", err
 	}
@@ -248,24 +265,52 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		sublog.Error().Err(err).Msg("pid file of 0-fs daemon not created")
 		return "", err
 	}
+
 	// and scan the logs after "mount ready"
 	if err := waitMountedLog(time.Second*5, logPath); err != nil {
 		sublog.Error().Err(err).Msg("0-fs daemon did not start properly")
 		return "", err
 	}
+	// the track file is a symlink to the process pid
+	// if the link is broken, then the fs has exited gracefully
+	// otherwise we can get the fs pid from the track path
+	// if the pid does not exist of the target does not exist
+	// we can clean up the named mount
+	trackPath := filepath.Join(f.run, name)
+	if err = os.Symlink(pidPath, trackPath); err != nil {
+		sublog.Error().Err(err).Msg("failed track fs pid")
+	}
 
 	return mountpoint, nil
 }
 
-func (f *flistModule) getMountOptions(pidPath string) (options, error) {
+func (f *flistModule) getPid(pidPath string) (int64, error) {
 	pid, err := ioutil.ReadFile(pidPath)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open pid file: %s", pidPath)
+		return 0, err
 	}
 
-	cmdline, err := ioutil.ReadFile(path.Join("/proc", string(pid), "cmdline"))
+	value, err := strconv.ParseInt(string(pid), 10, 64)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to read mount (%s) cmdline", pidPath)
+		return 0, errors.Wrap(err, "invalid pid value in file, expected int")
+	}
+
+	return value, nil
+}
+
+func (f *flistModule) getMountOptions(pidPath string) (options, error) {
+	pid, err := f.getPid(pidPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get pid from file: %s", pidPath)
+	}
+
+	return f.getMountOptionsForPID(pid)
+}
+
+func (f *flistModule) getMountOptionsForPID(pid int64) (options, error) {
+	cmdline, err := ioutil.ReadFile(path.Join("/proc", fmt.Sprint(pid), "cmdline"))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to read mount (%d) cmdline", pid)
 	}
 
 	parts := bytes.Split(cmdline, []byte{0})
@@ -333,10 +378,21 @@ func (f *flistModule) Umount(path string) error {
 
 	if err := syscall.Unmount(path, syscall.MNT_DETACH); err != nil {
 		log.Error().Err(err).Str("path", path).Msg("fail to umount flist")
+
 	}
 
 	if err := waitPidFile(time.Second*2, pidPath, false); err != nil {
 		log.Error().Err(err).Str("path", path).Msg("0-fs daemon did not stop properly")
+
+		pid, err := f.getPid(pidPath)
+		if err != nil {
+			return err
+		}
+
+		if err := forceStop(int(pid)); err != nil {
+			log.Error().Int64("pid", pid).Err(err).Msg("failed to kill 0-fs process")
+		}
+
 		return err
 	}
 
@@ -529,6 +585,35 @@ func waitMountedLog(timeout time.Duration, logfile string) error {
 	}(ctx, br, cErr)
 
 	return <-cErr
+}
+
+func forceStop(pid int) error {
+	slog := log.With().Int("pid", pid).Logger()
+	slog.Info().Msg("trying to force stop by killing the process")
+
+	p, err := os.FindProcess(int(pid))
+	if err != nil {
+		return err
+	}
+
+	if err := p.Signal(syscall.SIGTERM); err != nil {
+		slog.Error().Err(err).Msg("failed to send SIGTERM to process")
+	}
+
+	time.Sleep(time.Second)
+	if pidExist(p) {
+		slog.Info().Msgf("process didn't stop gracefully, lets kill it")
+		if err := p.Signal(syscall.SIGKILL); err != nil {
+			slog.Error().Err(err).Msg("failed to send SIGKILL to process")
+		}
+	}
+
+	return nil
+}
+
+func pidExist(p *os.Process) bool {
+	// https://github.com/golang/go/issues/14146#issuecomment-176888204
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 var _ pkg.Flister = (*flistModule)(nil)

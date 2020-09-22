@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/termie/go-shutil"
@@ -17,15 +18,16 @@ import (
 	"github.com/threefoldtech/zos/pkg/cache"
 	"github.com/threefoldtech/zos/pkg/network/ndmz"
 	"github.com/threefoldtech/zos/pkg/network/tuntap"
+	"github.com/threefoldtech/zos/pkg/network/wireguard"
 	"github.com/threefoldtech/zos/pkg/network/yggdrasil"
 
-	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 
 	"github.com/pkg/errors"
 
 	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
 
+	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/threefoldtech/zos/pkg/network/macvlan"
 	"github.com/threefoldtech/zos/pkg/network/nr"
 	"github.com/threefoldtech/zos/pkg/network/types"
@@ -41,11 +43,12 @@ import (
 
 const (
 	// ZDBIface is the name of the interface used in the 0-db network namespace
-	ZDBIface     = "zdb0"
-	wgPortDir    = "wireguard_ports"
-	networkDir   = "networks"
-	ipamLeaseDir = "ndmz-lease"
-	ipamPath     = "/var/cache/modules/networkd/lease"
+	ZDBIface           = "zdb0"
+	wgPortDir          = "wireguard_ports"
+	networkDir         = "networks"
+	ipamLeaseDir       = "ndmz-lease"
+	ipamPath           = "/var/cache/modules/networkd/lease"
+	zdbNamespacePrefix = "zdb-ns-"
 )
 
 const (
@@ -57,7 +60,7 @@ type networker struct {
 	networkDir   string
 	ipamLeaseDir string
 	tnodb        client.Directory
-	portSet      *set.UintSet
+	portSet      *set.UIntSet
 
 	ndmz ndmz.DMZ
 	ygg  *yggdrasil.Server
@@ -68,11 +71,6 @@ func NewNetworker(identity pkg.IdentityManager, tnodb client.Directory, storageD
 	vd, err := cache.VolatileDir("networkd", 50*mib)
 	if err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("failed to create networkd cache directory: %w", err)
-	}
-
-	wgDir := filepath.Join(vd, wgPortDir)
-	if err := os.MkdirAll(wgDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create wireguard port cache directory: %w", err)
 	}
 
 	nwDir := filepath.Join(vd, networkDir)
@@ -99,7 +97,7 @@ func NewNetworker(identity pkg.IdentityManager, tnodb client.Directory, storageD
 		tnodb:        tnodb,
 		networkDir:   nwDir,
 		ipamLeaseDir: ipamLease,
-		portSet:      set.NewUint(wgDir),
+		portSet:      set.NewInt(),
 
 		ygg:  ygg,
 		ndmz: ndmz,
@@ -112,6 +110,11 @@ func NewNetworker(identity pkg.IdentityManager, tnodb client.Directory, storageD
 			return nil, err
 		}
 	}
+
+	if err := nw.syncWGPorts(); err != nil {
+		return nil, err
+	}
+
 	if err := nw.publishWGPorts(); err != nil {
 		return nil, err
 	}
@@ -161,19 +164,29 @@ func (n *networker) Ready() error {
 	return nil
 }
 
+func (n *networker) ipv4Only() bool {
+	_, ipv4Only := n.ndmz.(*ndmz.Hidden)
+	return ipv4Only
+}
+
 func (n *networker) Join(networkdID pkg.NetID, containerID string, cfg pkg.ContainerNetworkConfig) (join pkg.Member, err error) {
 	// TODO:
 	// 1- Make sure this network id is actually deployed
-	// 2- Create a new namespace, then create a veth pair inside this namespace
-	// 3- Hook one end to the NR bridge
-	// 4- Assign IP to the veth endpoint inside the namespace.
-	// 5- return the namespace name
+	// 2- Check if the requested network config is doable
+	// 3- Create a new namespace, then create a veth pair inside this namespace
+	// 4- Hook one end to the NR bridge
+	// 5- Assign IP to the veth endpoint inside the namespace.
+	// 6- return the namespace name
 
 	log.Info().Str("network-id", string(networkdID)).Msg("joining network")
 
 	localNR, err := n.networkOf(string(networkdID))
 	if err != nil {
 		return join, errors.Wrapf(err, "couldn't load network with id (%s)", networkdID)
+	}
+
+	if cfg.PublicIP6 && n.ipv4Only() {
+		return join, errors.Errorf("this node runs in IPv4 only mode and you asked for a public IPv6. Impossible to fulfill the request")
 	}
 
 	netRes, err := nr.New(localNR)
@@ -186,7 +199,12 @@ func (n *networker) Join(networkdID pkg.NetID, containerID string, cfg pkg.Conta
 		ips[i] = net.ParseIP(addr)
 	}
 
-	join, err = netRes.Join(containerID, ips, cfg.PublicIP6)
+	join, err = netRes.Join(nr.ContainerConfig{
+		ContainerID: containerID,
+		IPs:         ips,
+		PublicIP6:   cfg.PublicIP6,
+		IPv4Only:    n.ipv4Only(),
+	})
 	if err != nil {
 		return join, errors.Wrap(err, "failed to load network resource")
 	}
@@ -266,10 +284,7 @@ func (n *networker) Leave(networkdID pkg.NetID, containerID string) error {
 // ZDBPrepare sends a macvlan interface into the
 // network namespace of a ZDB container
 func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
-	netNSName, err := ifaceutil.RandomName("zdb-ns-")
-	if err != nil {
-		return "", err
-	}
+	netNSName := zdbNamespacePrefix + strings.Replace(hw.String(), ":", "", -1)
 
 	netNs, err := createNetNS(netNSName)
 	if err != nil {
@@ -285,7 +300,7 @@ func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
 	if n.ygg != nil {
 		ip, err := n.ygg.SubnetFor(hw)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to generate ygg subnet IP: %w", err)
 		}
 
 		ips = []*net.IPNet{
@@ -297,7 +312,7 @@ func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
 
 		gw, err := n.ygg.Gateway()
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to get ygg gateway IP: %w", err)
 		}
 
 		routes = []*netlink.Route{
@@ -316,10 +331,43 @@ func (n networker) ZDBPrepare(hw net.HardwareAddr) (string, error) {
 	return netNSName, n.createMacVlan(ZDBIface, hw, ips, routes, netNs)
 }
 
+// ZDBDestroy is the opposite of ZDPrepare, it makes sure network setup done
+// for zdb is rewind. ns param is the namespace return by the ZDBPrepare
+func (n networker) ZDBDestroy(ns string) error {
+	if !strings.HasPrefix(ns, zdbNamespacePrefix) {
+		return fmt.Errorf("invalid zdb namespace name '%s'", ns)
+	}
+
+	if !namespace.Exists(ns) {
+		return nil
+	}
+
+	nSpace, err := namespace.GetByName(ns)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return errors.Wrapf(err, "failed to get namespace '%s'", ns)
+	}
+
+	return namespace.Delete(nSpace)
+}
+
 func (n networker) createMacVlan(iface string, hw net.HardwareAddr, ips []*net.IPNet, routes []*netlink.Route, netNs ns.NetNS) error {
-	macVlan, err := macvlan.Create(iface, n.ndmz.IP6PublicIface(), netNs)
-	if err != nil {
-		return errors.Wrap(err, "failed to create public mac vlan interface")
+	var macVlan *netlink.Macvlan
+	err := netNs.Do(func(_ ns.NetNS) error {
+		var err error
+		macVlan, err = macvlan.GetByName(iface)
+		return err
+	})
+
+	if _, ok := err.(netlink.LinkNotFoundError); ok {
+		macVlan, err = macvlan.Create(iface, n.ndmz.IP6PublicIface(), netNs)
+
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 
 	log.Debug().Str("HW", hw.String()).Str("macvlan", macVlan.Name).Msg("setting hw address on link")
@@ -648,6 +696,10 @@ func (n *networker) networkOf(id string) (nr pkg.NetResource, err error) {
 		return nr, fmt.Errorf("unknown network object version (%s)", version)
 	}
 
+	if err := net.Valid(); err != nil {
+		return net, errors.Wrapf(err, "failed to validate cached network resource: %s", net.NetID)
+	}
+
 	return net, nil
 }
 
@@ -841,20 +893,76 @@ func (n *networker) ZOSAddresses(ctx context.Context) <-chan pkg.NetlinkAddresse
 
 }
 
+func (n *networker) syncWGPorts() error {
+	names, err := namespace.List("n-")
+	if err != nil {
+		return err
+	}
+
+	readPort := func(name string) (int, error) {
+		netNS, err := namespace.GetByName(name)
+		if err != nil {
+			return 0, err
+		}
+		defer netNS.Close()
+
+		ifaceName := strings.Replace(name, "n-", "w-", 1)
+
+		var port int
+		err = netNS.Do(func(_ ns.NetNS) error {
+			link, err := wireguard.GetByName(ifaceName)
+			if err != nil {
+				return err
+			}
+			d, err := link.Device()
+			if err != nil {
+				return err
+			}
+
+			port = d.ListenPort
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+
+		return port, nil
+	}
+
+	for _, name := range names {
+		port, err := readPort(name)
+		if err != nil {
+			log.Error().Err(err).Str("namespace", name).Msgf("failed to read port for network namespace")
+			continue
+		}
+		//skip error cause we don't care if there are some duplicate at this point
+		_ = n.portSet.Add(uint(port))
+	}
+
+	return nil
+}
+
 // createNetNS create a network namespace and set lo interface up
 func createNetNS(name string) (ns.NetNS, error) {
+	var netNs ns.NetNS
+	var err error
+	if namespace.Exists(name) {
+		netNs, err = namespace.GetByName(name)
+	} else {
+		netNs, err = namespace.Create(name)
+	}
 
-	netNs, err := namespace.Create(name)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail to create network namespace %s: %w", name, err)
 	}
 
 	err = netNs.Do(func(_ ns.NetNS) error {
 		return ifaceutil.SetLoUp()
 	})
+
 	if err != nil {
 		namespace.Delete(netNs)
-		return nil, err
+		return nil, fmt.Errorf("failed to bring lo interface up in namespace %s: %w", name, err)
 	}
 
 	return netNs, nil

@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"fmt"
 	"net"
 
 	"github.com/threefoldtech/zos/pkg/network/types"
@@ -52,6 +53,10 @@ type Networker interface {
 	// it retusn the name of the network namespace created
 	// hw is an optional hardware address that will be set on the new interface
 	ZDBPrepare(hw net.HardwareAddr) (string, error)
+
+	// ZDBDestroy is the opposite of ZDPrepare, it makes sure network setup done
+	// for zdb is rewind. ns param is the namespace return by the ZDBPrepare
+	ZDBDestroy(ns string) error
 
 	// SetupTap sets up a tap device in the network namespace for the networkID. It is hooked
 	// to the network bridge. The name of the tap interface is returned
@@ -117,6 +122,48 @@ type NetResource struct {
 	Peers []Peer `json:"peers"`
 }
 
+// Valid checks if the network resource is valid.
+func (nr *NetResource) Valid() error {
+	if nr.NetID == "" {
+		return fmt.Errorf("network ID cannot be empty")
+	}
+
+	if nr.Name == "" {
+		return fmt.Errorf("network name cannot be empty")
+	}
+
+	if nr.NetworkIPRange.Nil() {
+		return fmt.Errorf("network IP range cannot be empty")
+	}
+
+	if nr.NodeID == "" {
+		return fmt.Errorf("network resource node ID cannot empty")
+	}
+	if len(nr.Subnet.IP) == 0 {
+		return fmt.Errorf("network resource subnet cannot empty")
+	}
+
+	if nr.WGPrivateKey == "" {
+		return fmt.Errorf("network resource wireguard private key cannot empty")
+	}
+
+	if nr.WGPublicKey == "" {
+		return fmt.Errorf("network resource wireguard public key cannot empty")
+	}
+
+	if nr.WGListenPort == 0 {
+		return fmt.Errorf("network resource wireguard listen port cannot empty")
+	}
+
+	for _, peer := range nr.Peers {
+		if err := peer.Valid(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Peer is the description of a peer of a NetResource
 type Peer struct {
 	// IPV4 subnet of the network resource of the peer
@@ -137,3 +184,19 @@ var (
 	// NetworkSchemaLatestVersion network object latest version
 	NetworkSchemaLatestVersion = NetworkSchemaV2
 )
+
+// Valid checks if peer is valid
+func (p *Peer) Valid() error {
+	if p.WGPublicKey == "" {
+		return fmt.Errorf("peer wireguard public key cannot empty")
+	}
+
+	if p.Subnet.Nil() {
+		return fmt.Errorf("peer wireguard subnet cannot empty")
+	}
+
+	if len(p.AllowedIPs) <= 0 {
+		return fmt.Errorf("peer wireguard allowedIPs cannot empty")
+	}
+	return nil
+}
