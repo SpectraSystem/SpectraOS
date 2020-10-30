@@ -13,6 +13,7 @@ import (
 	"github.com/cenkalti/backoff/v3"
 	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
 	"github.com/threefoldtech/zos/pkg/provision"
+	"github.com/threefoldtech/zos/pkg/provision/common"
 	"github.com/threefoldtech/zos/pkg/zdb"
 
 	"github.com/pkg/errors"
@@ -65,7 +66,7 @@ func (p *Provisioner) zdbProvisionImpl(ctx context.Context, reservation *provisi
 	}
 
 	var err error
-	config.PlainPassword, err = decryptSecret(p.zbus, config.Password)
+	config.PlainPassword, err = decryptSecret(config.Password, reservation.User, reservation.Version, p.zbus)
 	if err != nil {
 		return ZDBResult{}, errors.Wrap(err, "failed to decrypt namespace password")
 	}
@@ -416,31 +417,7 @@ func (p *Provisioner) zdbDecommission(ctx context.Context, reservation *provisio
 }
 
 func (p *Provisioner) deleteZdbContainer(containerID pkg.ContainerID) error {
-	container := stubs.NewContainerModuleStub(p.zbus)
-	flist := stubs.NewFlisterStub(p.zbus)
-	// networkMgr := stubs.NewNetworkerStub(p.zbus)
-
-	info, err := container.Inspect("zdb", containerID)
-	if err != nil && strings.Contains(err.Error(), "not found") {
-		return nil
-	} else if err != nil {
-		return errors.Wrapf(err, "failed to inspect container '%s'", containerID)
-	}
-
-	if err := container.Delete("zdb", containerID); err != nil {
-		return errors.Wrapf(err, "failed to delete container %s", containerID)
-	}
-
-	network := stubs.NewNetworkerStub(p.zbus)
-	if err := network.ZDBDestroy(info.Network.Namespace); err != nil {
-		return errors.Wrapf(err, "failed to destroy zdb network namespace")
-	}
-
-	if err := flist.Umount(info.RootFS); err != nil {
-		return errors.Wrapf(err, "failed to unmount flist at %s", info.RootFS)
-	}
-
-	return nil
+	return common.DeleteZdbContainer(containerID, p.zbus)
 }
 
 func socketDir(containerID pkg.ContainerID) string {
@@ -487,6 +464,7 @@ func (p *Provisioner) upgradeRunningZdb(ctx context.Context) error {
 	contmod := stubs.NewContainerModuleStub(p.zbus)
 
 	// Listing running zdb containers
+	log.Debug().Msg("fetching zdb containers list")
 	containers, err := contmod.List(zdbContainerNS)
 	if err != nil {
 		log.Error().Err(err).Msg("could not load containers list")
@@ -494,11 +472,14 @@ func (p *Provisioner) upgradeRunningZdb(ctx context.Context) error {
 	}
 
 	// fetching extected hash
+	log.Debug().Msg("fetching flist hash")
 	expected, err := flistmod.FlistHash(zdbFlistURL)
 	if err != nil {
 		log.Error().Err(err).Msg("could not load expected flist hash")
 		return err
 	}
+
+	log.Debug().Str("hash", expected).Msg("expecting hash")
 
 	// Checking if containers are running latest zdb version
 	for _, c := range containers {

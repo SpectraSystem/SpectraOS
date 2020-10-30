@@ -111,7 +111,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to instantiate BCDB client")
 	}
 
-	// keep track of resource unnits reserved and amount of workloads provisionned
+	// keep track of resource units reserved and amount of workloads provisionned
 	statser := &primitives.Counters{}
 
 	// to store reservation locally on the node
@@ -136,9 +136,10 @@ func main() {
 		Feedback:       explorer.NewFeedback(e, primitives.ResultToSchemaType),
 		Signer:         identity,
 		Statser:        statser,
+		ZbusCl:         zbusCl,
 	})
 
-	server.Register(zbus.ObjectID{Name: module, Version: "0.0.1"}, pkg.ProvisionMonitor(engine))
+	server.Register(zbus.ObjectID{Name: module, Version: "0.0.1"}, pkg.Provision(engine))
 
 	log.Info().
 		Str("broker", msgBrokerCon).

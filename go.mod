@@ -9,6 +9,7 @@ require (
 	github.com/alexflint/go-filemutex v0.0.0-20171028004239-d358565f3c3f
 	github.com/asaskevich/govalidator v0.0.0-20200108200545-475eaeb16496 // indirect
 	github.com/blang/semver v3.5.1+incompatible
+	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/cenkalti/backoff/v3 v3.2.2
 	github.com/containerd/cgroups v0.0.0-20200327175542-b44481373989
 	github.com/containerd/containerd v1.4.0-beta.1.0.20200615192441-ae2f3fdfd1a4
@@ -53,15 +54,17 @@ require (
 	github.com/opencontainers/runc v0.1.1 // indirect
 	github.com/opencontainers/runtime-spec v1.0.1
 	github.com/opencontainers/selinux v1.5.2 // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/pkg/errors v0.9.1
+	github.com/robfig/cron/v3 v3.0.0
 	github.com/rs/zerolog v1.19.0
 	github.com/shirou/gopsutil v2.19.11+incompatible
 	github.com/shirou/w32 v0.0.0-20160930032740-bb4de0191aa4 // indirect
 	github.com/stretchr/testify v1.6.1
 	github.com/syndtr/gocapability v0.0.0-20200815063812-42c35b437635 // indirect
 	github.com/termie/go-shutil v0.0.0-20140729215957-bcacb06fecae
-	github.com/threefoldtech/tfexplorer v0.4.1-0.20200925140208-64f1857969f1
-	github.com/threefoldtech/zbus v0.1.3
+	github.com/threefoldtech/tfexplorer v0.4.1-0.20201014110255-653c7314b944
+	github.com/threefoldtech/zbus v0.1.4
 	github.com/urfave/cli v1.22.4
 	github.com/vishvananda/netlink v1.1.0
 	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df
@@ -71,7 +74,9 @@ require (
 	github.com/yggdrasil-network/yggdrasil-go v0.3.15-0.20200526002434-ed3bf5ef0736
 	go.etcd.io/bbolt v1.3.4 // indirect
 	golang.org/x/crypto v0.0.0-20200311171314-f7b00557c8c4
+	golang.org/x/net v0.0.0-20200301022130-244492dfa37a
 	golang.org/x/sys v0.0.0-20200302150141-5c8b2ff67527
+	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20191219145116-fa6499c8e75f
 	google.golang.org/appengine v1.6.5 // indirect
 	google.golang.org/grpc v1.29.1 // indirect

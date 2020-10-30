@@ -17,6 +17,10 @@ import (
 
 func (s *storageModule) Find(nsID string) (allocation pkg.Allocation, err error) {
 	for _, pool := range s.pools {
+		if _, mounted := pool.Mounted(); !mounted {
+			continue
+		}
+
 		volumes, err := pool.Volumes()
 		if err != nil {
 			return allocation, errors.Wrapf(err, "failed to list volume on pool %s", pool.Name())
@@ -133,9 +137,9 @@ func (s *storageModule) Allocate(nsID string, diskType pkg.DeviceType, size uint
 			return allocation, errors.Wrap(err, "failed to generate new sub-volume name")
 		}
 
-		// we create the zdb instance with 0 (unlimited) because this subvolume is gonna
-		// be used for a new instance of ZDB.
-		volume, err = s.createSubvol(0, name, diskType)
+		// we create the zdb volume without configuring a quota
+		// the used size will the computed from the 0-db namespaces themselves
+		volume, err = s.createSubvol(size, name, diskType)
 		if err != nil {
 			return allocation, errors.Wrap(err, "failed to create sub-volume")
 		}
@@ -227,13 +231,14 @@ func (s *storageModule) checkForZDBCandidateVolumes(size uint64, poolType pkg.De
 	return candidates, nil
 }
 
-const zdbPoolPrefix = "zdb"
+// ZDBPoolPrefix is the prefix used for the subvolume create for 0-DB containers
+const ZDBPoolPrefix = "zdb"
 
 func genZDBPoolName() (string, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
 		return "", err
 	}
-	name := zdbPoolPrefix + id.String()
+	name := ZDBPoolPrefix + id.String()
 	return name, nil
 }

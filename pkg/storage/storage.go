@@ -24,9 +24,10 @@ import (
 const (
 	// CacheTarget is the path where the cache disk is mounted
 	CacheTarget = "/var/cache"
-	cacheLabel  = "zos-cache"
-	gib         = 1024 * 1024 * 1024
-	cacheSize   = 100 * gib
+	// cacheLabel is the name of the cache
+	cacheLabel = "zos-cache"
+	gib        = 1024 * 1024 * 1024
+	cacheSize  = 100 * gib
 )
 
 var (
@@ -96,7 +97,8 @@ func (s *storageModule) Total(kind pkg.DeviceType) (uint64, error) {
 			_, err := pool.MountWithoutScan()
 			if err != nil {
 				log.Error().Err(err).Msgf("Failed to mount pool %s", pool.Name())
-				return 0, err
+				// If we fail to mount the pool, don't exit.
+				continue
 			}
 			unmountAfter = true
 		}
@@ -336,17 +338,32 @@ func (s *storageModule) shutdownUnusedPools() error {
 }
 
 // CreateFilesystem with the given size in a storage pool.
-func (s *storageModule) CreateFilesystem(name string, size uint64, poolType pkg.DeviceType) (string, error) {
+func (s *storageModule) CreateFilesystem(name string, size uint64, poolType pkg.DeviceType) (pkg.Filesystem, error) {
 	log.Info().Msgf("Creating new volume with size %d", size)
 	if strings.HasPrefix(name, "zdb") {
-		return "", fmt.Errorf("invalid volume name. zdb prefix is reserved")
+		return pkg.Filesystem{}, fmt.Errorf("invalid volume name. zdb prefix is reserved")
 	}
 
-	fs, err := s.createSubvol(size, name, poolType)
+	fs, err := s.createSubvolWithQuota(size, name, poolType)
 	if err != nil {
-		return "", err
+		return pkg.Filesystem{}, err
 	}
-	return fs.Path(), nil
+
+	usage, err := fs.Usage()
+	if err != nil {
+		return pkg.Filesystem{}, err
+	}
+
+	return pkg.Filesystem{
+		ID:     fs.ID(),
+		FsType: fs.FsType(),
+		Name:   fs.Name(),
+		Path:   fs.Path(),
+		Usage: pkg.Usage{
+			Size: usage.Size,
+			Used: usage.Used,
+		},
+	}, nil
 }
 
 // ReleaseFilesystem with the given name, this will unmount and then delete
@@ -393,22 +410,93 @@ func (s *storageModule) ReleaseFilesystem(name string) error {
 	return nil
 }
 
+// ListFilesystems return all the filesystem managed by storeaged present on the nodes
+func (s *storageModule) ListFilesystems() ([]pkg.Filesystem, error) {
+	fss := make([]pkg.Filesystem, 0, 10)
+
+	for _, pool := range s.pools {
+		if _, mounted := pool.Mounted(); !mounted {
+			continue
+		}
+
+		volumes, err := pool.Volumes()
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range volumes {
+			// Do not return "special" volumes here
+			// instead the GetCacheFS and GetVdiskFS to access them
+			if v.Name() == cacheLabel ||
+				v.Name() == vdiskVolumeName {
+				continue
+			}
+
+			usage, err := v.Usage()
+			if err != nil {
+				return nil, err
+			}
+
+			fss = append(fss, pkg.Filesystem{
+				ID:     v.ID(),
+				FsType: v.FsType(),
+				Name:   v.Name(),
+				Path:   v.Path(),
+				Usage: pkg.Usage{
+					Size: usage.Size,
+					Used: usage.Used,
+				},
+				DiskType: pool.Type(),
+			})
+		}
+	}
+
+	return fss, nil
+}
+
 // Path return the path of the mountpoint of the named filesystem
 // if no volume with name exists, an empty path and an error is returned
-func (s *storageModule) Path(name string) (string, error) {
-	for idx := range s.pools {
-		filesystems, err := s.pools[idx].Volumes()
-		if err != nil {
-			return "", err
+func (s *storageModule) Path(name string) (pkg.Filesystem, error) {
+	for _, pool := range s.pools {
+		if _, mounted := pool.Mounted(); !mounted {
+			continue
 		}
-		for jdx := range filesystems {
-			if filesystems[jdx].Name() == name {
-				return filesystems[jdx].Path(), nil
+		filesystems, err := pool.Volumes()
+		if err != nil {
+			return pkg.Filesystem{}, err
+		}
+		for _, fs := range filesystems {
+			if fs.Name() == name {
+				usage, err := fs.Usage()
+				if err != nil {
+					return pkg.Filesystem{}, err
+				}
+
+				return pkg.Filesystem{
+					ID:     fs.ID(),
+					FsType: fs.FsType(),
+					Name:   fs.Name(),
+					Path:   fs.Path(),
+					Usage: pkg.Usage{
+						Size: usage.Size,
+						Used: usage.Used,
+					},
+					DiskType: pool.Type(),
+				}, nil
 			}
 		}
 	}
 
-	return "", errors.Wrapf(os.ErrNotExist, "subvolume '%s' not found", name)
+	return pkg.Filesystem{}, errors.Wrapf(os.ErrNotExist, "subvolume '%s' not found", name)
+}
+
+// GetCacheFS return the special filesystem used by 0-OS to store internal state and flist cache
+func (s *storageModule) GetCacheFS() (pkg.Filesystem, error) {
+	return s.Path(cacheLabel)
+}
+
+// GetVdiskFS return the filesystem used to store the vdisk file for the VM module
+func (s *storageModule) GetVdiskFS() (pkg.Filesystem, error) {
+	return s.Path(vdiskVolumeName)
 }
 
 // ensureCache creates a "cache" subvolume and mounts it in /var
@@ -420,15 +508,18 @@ func (s *storageModule) ensureCache() error {
 	var cacheFs filesystem.Volume
 
 	// check if cache volume available
-	for idx := range s.pools {
-		filesystems, err := s.pools[idx].Volumes()
+	for _, pool := range s.pools {
+		if _, mounted := pool.Mounted(); !mounted {
+			continue
+		}
+		filesystems, err := pool.Volumes()
 		if err != nil {
 			return err
 		}
-		for jdx := range filesystems {
-			if filesystems[jdx].Name() == cacheLabel {
-				log.Debug().Msgf("Found existing cache at %v", filesystems[jdx].Path())
-				cacheFs = filesystems[jdx]
+		for _, fs := range filesystems {
+			if fs.Name() == cacheLabel {
+				log.Debug().Msgf("Found existing cache at %v", fs.Path())
+				cacheFs = fs
 				break
 			}
 		}
@@ -441,7 +532,7 @@ func (s *storageModule) ensureCache() error {
 		log.Debug().Msgf("No cache found, try to create new cache")
 
 		log.Debug().Msgf("Trying to create new cache on SSD")
-		fs, err := s.createSubvol(cacheSize, cacheLabel, pkg.SSDDevice)
+		fs, err := s.createSubvolWithQuota(cacheSize, cacheLabel, pkg.SSDDevice)
 
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to create new cache on SSD")
@@ -452,7 +543,7 @@ func (s *storageModule) ensureCache() error {
 
 	if cacheFs == nil {
 		log.Debug().Msgf("Trying to create new cache on HDD")
-		fs, err := s.createSubvol(cacheSize, cacheLabel, pkg.HDDDevice)
+		fs, err := s.createSubvolWithQuota(cacheSize, cacheLabel, pkg.HDDDevice)
 
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to create new cache on HDD")
@@ -487,9 +578,26 @@ func (s *storageModule) ensureCache() error {
 	return nil
 }
 
-// createSubvol creates a subvolume with the given name and limits it to the given size
-// if the requested disk type does not have a storage pool available, an error is
-// returned
+// createSubvolWithQuota creates a subvolume with the given name and limits it to the given size
+// if the requested disk type does not have a storage pool with enough free size available, an error is returned
+// this methods does set a quota limit equal to size on the created volume
+func (s *storageModule) createSubvolWithQuota(size uint64, name string, poolType pkg.DeviceType) (filesystem.Volume, error) {
+	volume, err := s.createSubvol(size, name, poolType)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = volume.Limit(size); err != nil {
+		log.Error().Err(err).Str("volume", volume.Path()).Msg("failed to set volume size limit")
+		return nil, err
+	}
+
+	return volume, nil
+}
+
+// createSubvol creates a subvolume with the given name
+// if the requested disk type does not have a storage pool with enough free size available, an error is returned
+// this method does not set any quota on the subvolume, for this uses createSubvolWithQuota
 func (s *storageModule) createSubvol(size uint64, name string, poolType pkg.DeviceType) (filesystem.Volume, error) {
 	var err error
 
@@ -531,11 +639,6 @@ func (s *storageModule) createSubvol(size uint64, name string, poolType pkg.Devi
 		volume, err = candidate.Pool.AddVolume(name)
 		if err != nil {
 			log.Error().Err(err).Str("pool", candidate.Pool.Name()).Msg("failed to create new filesystem")
-			continue
-		}
-		if err = volume.Limit(size); err != nil {
-			candidate.Pool.RemoveVolume(volume.Name()) // try to recover
-			log.Error().Err(err).Str("volume", volume.Path()).Msg("failed to set volume size limit")
 			continue
 		}
 
@@ -638,6 +741,9 @@ func (s *storageModule) Monitor(ctx context.Context) <-chan pkg.PoolsStats {
 			}
 
 			for _, pool := range s.pools {
+				if _, mounted := pool.Mounted(); !mounted {
+					continue
+				}
 				devices, err := s.devices.ByLabel(ctx, pool.Name())
 				if err != nil {
 					log.Error().Err(err).Str("pool", pool.Name()).Msg("failed to get devices for pool")

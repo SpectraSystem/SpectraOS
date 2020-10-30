@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/provision"
 	"github.com/threefoldtech/zos/pkg/stubs"
@@ -85,7 +86,7 @@ func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *
 	result.ID = reservation.ID
 	result.IP = config.IP.String()
 
-	config.PlainClusterSecret, err = decryptSecret(p.zbus, config.ClusterSecret)
+	config.PlainClusterSecret, err = decryptSecret(config.ClusterSecret, reservation.User, reservation.Version, p.zbus)
 	if err != nil {
 		return result, errors.Wrap(err, "failed to decrypt namespace password")
 	}
@@ -101,7 +102,7 @@ func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *
 	}
 
 	var imagePath string
-	imagePath, err = flist.NamedMount(reservation.ID, k3osFlistURL, "", pkg.ReadOnlyMountOptions)
+	imagePath, err = flist.NamedMount(provision.FilesystemName(*reservation), k3osFlistURL, "", pkg.ReadOnlyMountOptions)
 	if err != nil {
 		return result, errors.Wrap(err, "could not mount k3os flist")
 	}
@@ -113,7 +114,7 @@ func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *
 	}()
 
 	var diskPath string
-	diskName := fmt.Sprintf("%s-%s", reservation.ID, "vda")
+	diskName := fmt.Sprintf("%s-%s", provision.FilesystemName(*reservation), "vda")
 	if storage.Exists(diskName) {
 		needsInstall = false
 		info, err := storage.Inspect(diskName)
@@ -275,8 +276,9 @@ func (p *Provisioner) kubernetesDecomission(ctx context.Context, reservation *pr
 		return errors.Wrap(err, "could not remove vDisk")
 	}
 
+	// Unmount flist, skip error if any.
 	if err := flist.NamedUmount(reservation.ID); err != nil {
-		return errors.Wrap(err, "could not unmount flist")
+		log.Err(err).Msg("could not unmount flist")
 	}
 
 	return nil

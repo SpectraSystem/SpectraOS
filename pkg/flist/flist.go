@@ -196,7 +196,7 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		return "", err
 	}
 
-	var backend string
+	var backend pkg.Filesystem
 	var newAllocation bool
 	var args []string
 	if !opts.ReadOnly {
@@ -218,8 +218,8 @@ func (f *flistModule) mount(name, url, storage string, opts pkg.MountOptions) (s
 		}
 	}
 
-	if len(backend) != 0 {
-		args = append(args, "-backend", backend)
+	if len(backend.Path) != 0 {
+		args = append(args, "-backend", backend.Path)
 		// in case of an error (mount is never fully completed)
 		// we need to deallocate the filesystem
 		defer func() {
@@ -367,6 +367,7 @@ func (f *flistModule) Umount(path string) error {
 	_, name := filepath.Split(path)
 	pidPath := filepath.Join(f.pid, name) + ".pid"
 
+	// from here on out, skip errors because we want to try to clean up as much as possible
 	opts, err := f.getMountOptions(pidPath)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to read mount options")
@@ -378,30 +379,27 @@ func (f *flistModule) Umount(path string) error {
 
 	if err := syscall.Unmount(path, syscall.MNT_DETACH); err != nil {
 		log.Error().Err(err).Str("path", path).Msg("fail to umount flist")
-
 	}
 
 	if err := waitPidFile(time.Second*2, pidPath, false); err != nil {
 		log.Error().Err(err).Str("path", path).Msg("0-fs daemon did not stop properly")
 
 		pid, err := f.getPid(pidPath)
-		if err != nil {
-			return err
+		if err == nil {
+			if err := forceStop(int(pid)); err != nil {
+				log.Error().Int64("pid", pid).Err(err).Msg("failed to kill 0-fs process")
+			}
+		} else {
+			log.Error().Int64("pid", pid).Err(err).Msg("failed to get pid")
 		}
 
-		if err := forceStop(int(pid)); err != nil {
-			log.Error().Int64("pid", pid).Err(err).Msg("failed to kill 0-fs process")
-		}
-
-		return err
 	}
 
 	// clean up working dirs
 	logPath := filepath.Join(f.log, name) + ".log"
 	for _, path := range []string{logPath, path} {
 		if err := os.RemoveAll(path); err != nil {
-			log.Error().Err(err).Msg("fail to remove %s")
-			return err
+			log.Error().Err(err).Msgf("fail to remove %s", logPath)
 		}
 	}
 
@@ -411,7 +409,7 @@ func (f *flistModule) Umount(path string) error {
 	}
 
 	if err := f.storage.ReleaseFilesystem(name); err != nil {
-		return errors.Wrap(err, "fail to clean up subvolume")
+		log.Error().Err(err).Msg("fail to clean up subvolume")
 	}
 
 	return nil
@@ -449,18 +447,29 @@ func (f *flistModule) downloadFlist(url string) (string, error) {
 	hash, err := f.FlistHash(url)
 	if err == nil {
 		flistPath := filepath.Join(f.flist, strings.TrimSpace(string(hash)))
-		_, err = os.Stat(flistPath)
+		f, err := os.Open(flistPath)
 		if err != nil && !os.IsNotExist(err) {
 			return "", err
 		}
+		defer f.Close()
+
 		if err == nil {
-			log.Info().Str("url", url).Msg("flist already in cache")
-			// flist is already present locally, just return its path
-			return flistPath, nil
+			log.Info().Str("url", url).Msg("flist already in on the filesystem")
+			// flist is already present locally, verify it's still valid
+			equal, err := md5Compare(hash, f)
+			if err != nil {
+				return "", err
+			}
+			if equal {
+				return flistPath, nil
+			}
+			log.Info().Str("url", url).Msg("flist on filesystem is corrupted, re-downloading it")
+			// if not equal the rest of the function will overwrite the faulty flist
+		} else {
+			log.Info().Str("url", url).Msg("flist not in cache, downloading")
 		}
 	}
 
-	log.Info().Str("url", url).Msg("flist not in cache, downloading")
 	// we don't have the flist locally yet, let's download it
 	resp, err := http.Get(url)
 	if err != nil {
@@ -504,6 +513,15 @@ func (f *flistModule) saveFlist(r io.Reader) (string, error) {
 	}
 
 	return path, nil
+}
+
+func md5Compare(hash string, r io.Reader) (bool, error) {
+	h := md5.New()
+	_, err := io.Copy(h, r)
+	if err != nil {
+		return false, err
+	}
+	return strings.Compare(fmt.Sprintf("%x", h.Sum(nil)), hash) == 0, nil
 }
 
 func random() (string, error) {

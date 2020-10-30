@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/tfexplorer/client"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/app"
 )
 
 var (
@@ -28,6 +29,13 @@ type ReservationPoller interface {
 	// reservation.ID >= from. So a client to the Poll method should make
 	// sure to call it with the last (MAX) reservation ID he receieved.
 	Poll(nodeID pkg.Identifier, from uint64) (reservations []*Reservation, lastID uint64, err error)
+}
+
+// ReservationJob wraps a reservation type and has
+// a boolean to indicate it is the last reservation
+type ReservationJob struct {
+	Reservation
+	last bool
 }
 
 // PollSource does a long poll on address to get new and to be deleted
@@ -48,21 +56,25 @@ type pollSource struct {
 	maxSleep time.Duration
 }
 
-func (s *pollSource) Reservations(ctx context.Context) <-chan *Reservation {
-	ch := make(chan *Reservation)
-	// on the first run we will get all the reservation
-	// ever made to this know, to make sure we provision
-	// everything at boot
-	// after that, we only ask for the new reservations
+func (s *pollSource) Reservations(ctx context.Context) <-chan *ReservationJob {
+
+	ch := make(chan *ReservationJob)
+	// On the first run we will get all the reservation ever made to this node to make sure we provision everything at boot.
+	// After that, we only ask for the new reservations.
 	go func() {
 		defer close(ch)
 		var next uint64
+		var previousLastID uint64
+		var triggerCleanup = true
 		on := time.Now()
-		log.Info().Msg("Started polling for reservations")
+		log.Info().Msg("Start polling for reservations")
+		slog := app.SampledLogger()
+
 		for {
 			time.Sleep(time.Until(on))
 			on = time.Now().Add(s.maxSleep)
-			log.Info().Uint64("next", next).Msg("Polling for reservations")
+
+			slog.Info().Uint64("next", next).Msg("Polling for reservations")
 
 			res, lastID, err := s.store.Poll(pkg.StrIdentifier(s.nodeID), next)
 			if err != nil && err != ErrPollEOS {
@@ -84,9 +96,26 @@ func (s *pollSource) Reservations(ctx context.Context) <-chan *Reservation {
 				return
 			default:
 				for _, r := range res {
-					ch <- r
+					reservation := ReservationJob{
+						*r,
+						false,
+					}
+					ch <- &reservation
+				}
+
+				// if the explorer return twice the same last ID
+				// it means we have processed all the existing reservation for now
+				// it is safe to trigger a cleanup
+				if triggerCleanup && previousLastID == lastID {
+					ch <- &ReservationJob{
+						Reservation: Reservation{},
+						last:        true,
+					}
+					triggerCleanup = false
 				}
 			}
+
+			previousLastID = lastID
 
 			if err == ErrPollEOS {
 				return
@@ -117,16 +146,18 @@ func NewDecommissionSource(store ReservationExpirer) ReservationSource {
 	}
 }
 
-func (s *decommissionSource) Reservations(ctx context.Context) <-chan *Reservation {
+func (s *decommissionSource) Reservations(ctx context.Context) <-chan *ReservationJob {
 	log.Info().Msg("start decommission source")
-	c := make(chan *Reservation)
+	c := make(chan *ReservationJob)
+	slog := app.SampledLogger()
 
 	go func() {
 		defer close(c)
 
 		for {
 			<-time.After(time.Second * 20) //TODO: make configuration ? default value ?
-			log.Info().Msg("check for expired reservation")
+
+			slog.Info().Msg("check for expired reservation")
 
 			reservations, err := s.store.GetExpired()
 			if err != nil {
@@ -145,7 +176,12 @@ func (s *decommissionSource) Reservations(ctx context.Context) <-chan *Reservati
 						Time("created", r.Created).
 						Str("duration", fmt.Sprintf("%v", r.Duration)).
 						Msg("reservation expired")
-					c <- r
+
+					reservation := ReservationJob{
+						*r,
+						false,
+					}
+					c <- &reservation
 				}
 			}
 		}
@@ -165,14 +201,14 @@ func CombinedSource(sources ...ReservationSource) ReservationSource {
 	}
 }
 
-func (s *combinedSource) Reservations(ctx context.Context) <-chan *Reservation {
+func (s *combinedSource) Reservations(ctx context.Context) <-chan *ReservationJob {
 	var wg sync.WaitGroup
 
-	out := make(chan *Reservation)
+	out := make(chan *ReservationJob)
 
 	// Start an send goroutine for each input channel in cs. send
 	// copies values from c to out until c is closed, then calls wg.Done.
-	send := func(c <-chan *Reservation) {
+	send := func(c <-chan *ReservationJob) {
 		for n := range c {
 			out <- n
 		}

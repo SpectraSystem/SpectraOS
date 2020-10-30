@@ -169,7 +169,7 @@ func (p *Provisioner) containerProvisionImpl(ctx context.Context, reservation *p
 	}
 
 	for k, v := range config.SecretEnv {
-		v, err := decryptSecret(p.zbus, v)
+		v, err := decryptSecret(v, reservation.User, reservation.Version, p.zbus)
 		if err != nil {
 			return ContainerResult{}, errors.Wrapf(err, "failed to decrypt secret env var '%s'", k)
 		}
@@ -182,14 +182,14 @@ func (p *Provisioner) containerProvisionImpl(ctx context.Context, reservation *p
 		stderr := log.Data.Stderr
 
 		if len(log.Data.SecretStdout) > 0 {
-			stdout, err = decryptSecret(p.zbus, log.Data.SecretStdout)
+			stdout, err = decryptSecret(log.Data.SecretStdout, reservation.User, reservation.Version, p.zbus)
 			if err != nil {
 				return ContainerResult{}, errors.Wrap(err, "failed to decrypt log.secret_stdout var")
 			}
 		}
 
 		if len(log.Data.SecretStderr) > 0 {
-			stderr, err = decryptSecret(p.zbus, log.Data.SecretStderr)
+			stderr, err = decryptSecret(log.Data.SecretStderr, reservation.User, reservation.Version, p.zbus)
 			if err != nil {
 				return ContainerResult{}, errors.Wrap(err, "failed to decrypt log.secret_stdout var")
 			}
@@ -244,7 +244,7 @@ func (p *Provisioner) containerProvisionImpl(ctx context.Context, reservation *p
 	}
 
 	var mnt string
-	mnt, err = flistClient.NamedMount(reservation.ID, config.FList, config.FlistStorage, rootfsMntOpt)
+	mnt, err = flistClient.NamedMount(provision.FilesystemName(*reservation), config.FList, config.FlistStorage, rootfsMntOpt)
 	if err != nil {
 		return ContainerResult{}, err
 	}
@@ -258,7 +258,7 @@ func (p *Provisioner) containerProvisionImpl(ctx context.Context, reservation *p
 		if err := os.MkdirAll(path.Join(mnt, mountpoint), 0755); err != nil {
 			return ContainerResult{}, err
 		}
-		var source string
+		var source pkg.Filesystem
 		source, err = storageClient.Path(mount.VolumeID)
 		if err != nil {
 			return ContainerResult{}, errors.Wrapf(err, "failed to get the mountpoint path of the volume %s", mount.VolumeID)
@@ -267,7 +267,7 @@ func (p *Provisioner) containerProvisionImpl(ctx context.Context, reservation *p
 		mounts = append(
 			mounts,
 			pkg.MountInfo{
-				Source: source,
+				Source: source.Path,
 				Target: mountpoint,
 			},
 		)
