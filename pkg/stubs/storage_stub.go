@@ -111,22 +111,6 @@ func (s *StorageModuleStub) GetCacheFS() (ret0 pkg.Filesystem, ret1 error) {
 	return
 }
 
-func (s *StorageModuleStub) GetVdiskFS() (ret0 pkg.Filesystem, ret1 error) {
-	args := []interface{}{}
-	result, err := s.client.Request(s.module, s.object, "GetVdiskFS", args...)
-	if err != nil {
-		panic(err)
-	}
-	if err := result.Unmarshal(0, &ret0); err != nil {
-		panic(err)
-	}
-	ret1 = new(zbus.RemoteError)
-	if err := result.Unmarshal(1, &ret1); err != nil {
-		panic(err)
-	}
-	return
-}
-
 func (s *StorageModuleStub) ListFilesystems() (ret0 []pkg.Filesystem, ret1 error) {
 	args := []interface{}{}
 	result, err := s.client.Request(s.module, s.object, "ListFilesystems", args...)

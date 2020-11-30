@@ -1,1 +1,24 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/ea644041ae5194b70c9d718a1cb1804c
+package provision
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/threefoldtech/zos/pkg"
+	"gotest.tools/assert"
+)
+
+func TestFilesystemNameFromReservation(t *testing.T) {
+	r := Reservation{
+		ID: "123-1",
+	}
+
+	name := FilesystemName(r)
+	assert.Equal(t, r.ID, name)
+
+	id, err := WorkloadIDFromFilesystem(pkg.Filesystem{
+		Name: name,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(123), id)
+}

@@ -3,6 +3,7 @@ package pkg
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 )
 
 //go:generate mkdir -p stubs
@@ -164,9 +165,6 @@ type VolumeAllocater interface {
 
 	// GetCacheFS return the special filesystem used by 0-OS to store internal state and flist cache
 	GetCacheFS() (Filesystem, error)
-
-	// GetVdiskFS return the filesystem used to store the vdisk file for the VM module
-	GetVdiskFS() (Filesystem, error)
 }
 
 // VDisk info returned by a call to inspect
@@ -175,6 +173,11 @@ type VDisk struct {
 	Path string
 	// Size in bytes
 	Size int64
+}
+
+// Name returns the Name part of the disk path
+func (d *VDisk) Name() string {
+	return filepath.Base(d.Path)
 }
 
 // VDiskModule interface
@@ -187,6 +190,8 @@ type VDiskModule interface {
 	Exists(id string) bool
 	// Inspect return info about the disk
 	Inspect(id string) (VDisk, error)
+	// List lists all the available vdisks
+	List() ([]VDisk, error)
 }
 
 // StorageModule defines the api for storage

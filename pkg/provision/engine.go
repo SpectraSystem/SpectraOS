@@ -35,6 +35,7 @@ type Engine struct {
 	signer         Signer
 	statser        Statser
 	zbusCl         zbus.Client
+	janitor        *Janitor
 }
 
 // EngineOps are the configuration of the engine
@@ -63,6 +64,10 @@ type EngineOps struct {
 	Statser Statser
 	// ZbusCl is a client to Zbus
 	ZbusCl zbus.Client
+
+	// Janitor is used to clean up some of the resources that might be lingering on the node
+	// if not set, no cleaning up will be done
+	Janitor *Janitor
 }
 
 // New creates a new engine. Once started, the engine
@@ -82,6 +87,7 @@ func New(opts EngineOps) *Engine {
 		signer:         opts.Signer,
 		statser:        opts.Statser,
 		zbusCl:         opts.ZbusCl,
+		janitor:        opts.Janitor,
 	}
 }
 
@@ -96,10 +102,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	_, err := c.AddFunc("@midnight", func() {
 		cleanUp <- struct{}{}
 	})
-	c.Start()
 	if err != nil {
 		return fmt.Errorf("failed to setup cron task: %w", err)
 	}
+
+	c.Start()
 	defer c.Stop()
 
 	for {
@@ -157,7 +164,12 @@ func (e *Engine) Run(ctx context.Context) error {
 				continue
 			}
 			log.Info().Msg("start cleaning up resources")
-			if err := CleanupResources(ctx, e.zbusCl); err != nil {
+			if e.janitor == nil {
+				log.Info().Msg("janitor is not configured, skipping clean up")
+				continue
+			}
+
+			if err := e.janitor.CleanupResources(ctx); err != nil {
 				log.Error().Err(err).Msg("failed to cleanup resources")
 				continue
 			}
@@ -223,23 +235,29 @@ func (e *Engine) provision(ctx context.Context, r *Reservation) error {
 		return errors.Wrapf(err, "failed to build result object for reservation: %s", result.ID)
 	}
 
-	// we make sure we store the reservation in cache first before
-	// returning the reply back to the grid, this is to make sure
-	// if the reply failed for any reason, the node still doesn't
-	// try to redeploy that reservation.
-	r.ID = realID
-	r.Result = *result
-	if err := e.cache.Add(r); err != nil {
-		return errors.Wrapf(err, "failed to cache reservation %s locally", r.ID)
-	}
-
+	// send response to explorer
 	if err := e.reply(ctx, result); err != nil {
 		log.Error().Err(err).Msg("failed to send result to BCDB")
 	}
 
-	// we skip the counting.
+	// if we fail to decomission the reservation then must be marked
+	// as deleted so it's never tried again. we also skip caching
+	// the reservation object. this is similar to what decomission does
+	// since on a decomission we also clear up the cache.
 	if provisionError != nil {
+		// we need to mark the reservation as deleted as well
+		if err := e.feedback.Deleted(e.nodeID, realID); err != nil {
+			log.Error().Err(err).Msg("failed to mark failed reservation as deleted")
+		}
+
 		return provisionError
+	}
+
+	// we only cache successful reservations
+	r.ID = realID
+	r.Result = *result
+	if err := e.cache.Add(r); err != nil {
+		return errors.Wrapf(err, "failed to cache reservation %s locally", r.ID)
 	}
 
 	// If an update occurs on the network we don't increment the counter
@@ -290,6 +308,18 @@ func (e *Engine) decommission(ctx context.Context, r *Reservation) error {
 	realID := r.ID
 	if r.Reference != "" {
 		r.ID = r.Reference
+	}
+
+	if r.Result.State == StateError {
+		// this reservation already failed to deploy
+		// this code here shouldn't be executing because if
+		// the reservation has error-ed, it means is should
+		// not be in cache.
+		// BUT
+		// that was not always the case, so instead we
+		// will just return. here
+		log.Warn().Str("id", realID).Msg("skipping reservation because it is not provisioned")
+		return nil
 	}
 
 	err = fn(ctx, r)
@@ -400,18 +430,24 @@ func (e *Engine) updateStats() error {
 	wl := e.statser.CurrentWorkloads()
 	r := e.statser.CurrentUnits()
 
-	storaged := stubs.NewStorageModuleStub(e.zbusCl)
+	if e.zbusCl != nil {
+		// TODO: this is a very specific zos code that should not be
+		// here. this is a quick fix for the tfgateways
+		// but should be implemented cleanely after
+		storaged := stubs.NewStorageModuleStub(e.zbusCl)
 
-	cache, err := storaged.GetCacheFS()
-	if err != nil {
-		return err
-	}
+		cache, err := storaged.GetCacheFS()
+		if err != nil {
+			return err
+		}
 
-	switch cache.DiskType {
-	case pkg.SSDDevice:
-		r.Sru += float64(cache.Usage.Size / gib)
-	case pkg.HDDDevice:
-		r.Hru += float64(cache.Usage.Size / gib)
+		switch cache.DiskType {
+		case pkg.SSDDevice:
+			r.Sru += float64(cache.Usage.Size / gib)
+		case pkg.HDDDevice:
+			r.Hru += float64(cache.Usage.Size / gib)
+		}
+
 	}
 
 	log.Info().
