@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	"github.com/pkg/errors"
 	"github.com/threefoldtech/tfexplorer/models/generated/directory"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/provision"
@@ -184,6 +185,36 @@ type resourceUnits struct {
 	CRU uint64 `json:"cru,omitempty"`
 }
 
+// CheckMemoryRequirements checks memory requirements for a reservation and compares it to whats in the counters
+// and what is the total memory on this node
+func (c *Counters) CheckMemoryRequirements(r *provision.Reservation, totalMemAvailable uint64) error {
+	var requestedUnits resourceUnits
+	var err error
+
+	switch r.Type {
+	case ContainerReservation:
+		requestedUnits, err = processContainer(r)
+		if err != nil {
+			return err
+		}
+
+	case KubernetesReservation:
+		requestedUnits, err = processKubernetes(r)
+		if err != nil {
+			return err
+		}
+	}
+
+	if requestedUnits.MRU != 0 {
+		// If current MRU + requested MRU exceeds total, return an error
+		if c.MRU.Current()+requestedUnits.MRU > totalMemAvailable {
+			return errors.New("not enough free resources to support this memory size")
+		}
+	}
+
+	return nil
+}
+
 func processVolume(r *provision.Reservation) (u resourceUnits, err error) {
 	var volume Volume
 	if err = json.Unmarshal(r.Data, &volume); err != nil {
@@ -313,6 +344,10 @@ func processKubernetes(r *provision.Reservation) (u resourceUnits, err error) {
 		u.CRU = 4
 		u.MRU = 8 * gib
 		u.SRU = 50 * gib
+	case 18:
+		u.CRU = 1
+		u.MRU = 1 * gib
+		u.SRU = 25 * gib
 	}
 
 	return u, nil

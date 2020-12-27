@@ -11,17 +11,20 @@ import (
 
 	"github.com/cenkalti/backoff/v3"
 	"github.com/jbenet/go-base58"
+	"github.com/patrickmn/go-cache"
+	"github.com/robfig/cron/v3"
+	"github.com/shirou/gopsutil/mem"
 	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/stubs"
-
-	"github.com/robfig/cron/v3"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 )
 
 const gib = 1024 * 1024 * 1024
+
+const minimunZosMemory = 2 * gib
 
 // Engine is the core of this package
 // The engine is responsible to manage provision and decomission of workloads on the system
@@ -36,6 +39,9 @@ type Engine struct {
 	statser        Statser
 	zbusCl         zbus.Client
 	janitor        *Janitor
+
+	memCache          *cache.Cache
+	totalMemAvailable uint64
 }
 
 // EngineOps are the configuration of the engine
@@ -76,19 +82,26 @@ type EngineOps struct {
 // the default implementation is a single threaded worker. so it process
 // one reservation at a time. On error, the engine will log the error. and
 // continue to next reservation.
-func New(opts EngineOps) *Engine {
-	return &Engine{
-		nodeID:         opts.NodeID,
-		source:         opts.Source,
-		cache:          opts.Cache,
-		feedback:       opts.Feedback,
-		provisioners:   opts.Provisioners,
-		decomissioners: opts.Decomissioners,
-		signer:         opts.Signer,
-		statser:        opts.Statser,
-		zbusCl:         opts.ZbusCl,
-		janitor:        opts.Janitor,
+func New(opts EngineOps) (*Engine, error) {
+	memStats, err := mem.VirtualMemory()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed retrieve memory stats")
 	}
+
+	return &Engine{
+		nodeID:            opts.NodeID,
+		source:            opts.Source,
+		cache:             opts.Cache,
+		feedback:          opts.Feedback,
+		provisioners:      opts.Provisioners,
+		decomissioners:    opts.Decomissioners,
+		signer:            opts.Signer,
+		statser:           opts.Statser,
+		zbusCl:            opts.ZbusCl,
+		janitor:           opts.Janitor,
+		memCache:          cache.New(30*time.Minute, 30*time.Second),
+		totalMemAvailable: memStats.Total - minimunZosMemory,
+	}, nil
 }
 
 // Run starts reader reservation from the Source and handle them
@@ -124,6 +137,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			if reservation.last {
 				isAllWorkloadsProcessed = true
 				// Trigger cleanup by sending a struct onto the channel
+				log.Debug().Msg("kicking clean up after redeploying history")
 				cleanUp <- struct{}{}
 				continue
 			}
@@ -146,6 +160,18 @@ func (e *Engine) Run(ctx context.Context) error {
 				}
 			} else {
 				slog.Info().Msg("start provisioning reservation")
+
+				//TODO:
+				// this is just a hack now to avoid having double provisioning
+				// other logs has been added in other places so we can find why
+				// the node keep receiving the same reservation twice
+				if _, ok := e.memCache.Get(reservation.ID); ok {
+					log.Debug().Str("id", reservation.ID).Msg("skipping reservation since it has just been processes!")
+					continue
+				}
+
+				e.memCache.Set(reservation.ID, struct{}{}, cache.DefaultExpiration)
+
 				if err := e.provision(ctx, &reservation.Reservation); err != nil {
 					log.Error().Err(err).Msgf("failed to provision reservation %s", reservation.ID)
 					continue
@@ -218,17 +244,7 @@ func (e *Engine) provision(ctx context.Context, r *Reservation) error {
 		r.ID = r.Reference
 	}
 
-	returned, provisionError := fn(ctx, r)
-	if provisionError != nil {
-		log.Error().
-			Err(provisionError).
-			Str("id", r.ID).
-			Msgf("failed to apply provision")
-	} else {
-		log.Info().
-			Str("result", fmt.Sprintf("%v", returned)).
-			Msgf("workload deployed")
-	}
+	returned, provisionError := e.provisionForward(ctx, fn, r)
 
 	result, err := e.buildResult(realID, r.Type, provisionError, returned)
 	if err != nil {
@@ -282,6 +298,27 @@ func (e *Engine) provision(ctx context.Context, r *Reservation) error {
 	}
 
 	return nil
+}
+
+func (e *Engine) provisionForward(ctx context.Context, fn ProvisionerFunc, r *Reservation) (interface{}, error) {
+	if err := e.statser.CheckMemoryRequirements(r, e.totalMemAvailable); err != nil {
+		return nil, errors.Wrapf(err, "failed to apply provision")
+	}
+
+	returned, provisionError := fn(ctx, r)
+	if provisionError != nil {
+		log.Error().
+			Err(provisionError).
+			Str("id", r.ID).
+			Msgf("failed to apply provision")
+		return nil, provisionError
+	}
+
+	log.Info().
+		Str("result", fmt.Sprintf("%v", returned)).
+		Msgf("workload deployed")
+
+	return returned, nil
 }
 
 func (e *Engine) decommission(ctx context.Context, r *Reservation) error {
@@ -448,6 +485,7 @@ func (e *Engine) updateStats() error {
 			r.Hru += float64(cache.Usage.Size / gib)
 		}
 
+		r.Mru += float64(minimunZosMemory / gib)
 	}
 
 	log.Info().

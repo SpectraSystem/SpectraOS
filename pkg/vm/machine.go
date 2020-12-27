@@ -15,6 +15,7 @@ import (
 
 const (
 	configFileName = "config.json"
+	logFileName    = "machine.log"
 )
 
 // Boot config struct
@@ -53,6 +54,9 @@ type Machine struct {
 	Drives     []Drive     `json:"drives"`
 	Interfaces []Interface `json:"network-interfaces"`
 	Config     Config      `json:"machine-config"`
+	// NoKeepAlive is not used by firecracker, but instead a marker
+	// for the vm  mananger to not restart the machine when it stops
+	NoKeepAlive bool `json:"no-keep-alive"`
 }
 
 // Jailed represents a jailed machine.
@@ -179,7 +183,7 @@ func (j *Jailed) Start(ctx context.Context) error {
 
 // Log returns machine log file path
 func (j *Jailed) Log(base string) string {
-	return filepath.Join(j.Root, "machine.log")
+	return filepath.Join(j.Root, logFileName)
 }
 
 func (j *Jailed) exec(ctx context.Context) error {

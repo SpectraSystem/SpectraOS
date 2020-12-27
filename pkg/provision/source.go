@@ -58,7 +58,6 @@ type pollSource struct {
 }
 
 func (s *pollSource) Reservations(ctx context.Context) <-chan *ReservationJob {
-
 	ch := make(chan *ReservationJob)
 	// On the first run we will get all the reservation ever made to this node to make sure we provision everything at boot.
 	// After that, we only ask for the new reservations.
@@ -88,6 +87,15 @@ func (s *pollSource) Reservations(ctx context.Context) <-chan *ReservationJob {
 					next = lastID + 1
 				}
 				continue
+			}
+
+			ids := make([]string, 0, len(res))
+			for _, r := range res {
+				ids = append(ids, fmt.Sprintf("%s [D: %v]", r.ID, r.ToDelete))
+			}
+
+			if len(ids) > 0 {
+				log.Info().Strs("reservation-ids", ids).Msg("received ids for processing")
 			}
 
 			next = lastID + 1

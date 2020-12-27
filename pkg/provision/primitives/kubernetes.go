@@ -13,6 +13,7 @@ import (
 	"github.com/threefoldtech/tfexplorer/schema"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/app"
+	"github.com/threefoldtech/zos/pkg/network/ifaceutil"
 	"github.com/threefoldtech/zos/pkg/provision"
 	"github.com/threefoldtech/zos/pkg/stubs"
 )
@@ -57,6 +58,17 @@ const k3osFlistURL = "https://hub.grid.tf/lee/k3os.flist"
 
 func (p *Provisioner) kubernetesProvision(ctx context.Context, reservation *provision.Reservation) (interface{}, error) {
 	return p.kubernetesProvisionImpl(ctx, reservation)
+}
+
+func ensureFList(flister pkg.Flister, url string) (string, error) {
+	hash, err := flister.FlistHash(url)
+	if err != nil {
+		return "", err
+	}
+
+	name := fmt.Sprintf("k8s:%s", hash)
+
+	return flister.NamedMount(name, url, "", pkg.ReadOnlyMountOptions)
 }
 
 func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *provision.Reservation) (result KubernetesResult, err error) {
@@ -112,17 +124,10 @@ func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *
 		return result, nil
 	}
 
-	var imagePath string
-	imagePath, err = flist.NamedMount(provision.FilesystemName(*reservation), k3osFlistURL, "", pkg.ReadOnlyMountOptions)
+	imagePath, err := ensureFList(flist, k3osFlistURL)
 	if err != nil {
 		return result, errors.Wrap(err, "could not mount k3os flist")
 	}
-	// In case of future errors in the provisioning make sure we clean up
-	defer func() {
-		if err != nil {
-			_ = flist.Umount(imagePath)
-		}
-	}()
 
 	var diskPath string
 	diskName := fmt.Sprintf("%s-%s", provision.FilesystemName(*reservation), "vda")
@@ -160,14 +165,14 @@ func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *
 
 	var pubIface string
 	if config.PublicIP != 0 {
-		pubIface, err = network.SetupPubTap(netID)
+		pubIface, err = network.SetupPubTap(pubIPResID(config.PublicIP))
 		if err != nil {
 			return result, errors.Wrap(err, "could not set up tap device for public network")
 		}
 
 		defer func() {
 			if err != nil {
-				_ = network.RemovePubTap(netID)
+				_ = network.RemovePubTap(pubIPResID(config.PublicIP))
 			}
 		}()
 	}
@@ -196,7 +201,7 @@ func (p *Provisioner) kubernetesProvisionImpl(ctx context.Context, reservation *
 func (p *Provisioner) kubernetesInstall(ctx context.Context, name string, cpu uint8, memory uint64, diskPath string, imagePath string, networkInfo pkg.VMNetworkInfo, cfg Kubernetes) error {
 	vm := stubs.NewVMModuleStub(p.zbus)
 
-	cmdline := fmt.Sprintf("console=ttyS0 reboot=k panic=1 k3os.mode=install k3os.install.silent k3os.install.device=/dev/vda k3os.token=%s", cfg.PlainClusterSecret)
+	cmdline := fmt.Sprintf("console=ttyS0 reboot=k panic=1 k3os.mode=install k3os.install.silent k3os.debug k3os.install.device=/dev/vda k3os.token=%s k3os.k3s_args=\"--flannel-iface=eth0\"", cfg.PlainClusterSecret)
 	// if there is no server url configured, the node is set up as a master, therefore
 	// this will cause nodes with an empty master list to be implicitly treated as
 	// a master node
@@ -276,7 +281,6 @@ func (p *Provisioner) kubernetesRun(ctx context.Context, name string, cpu uint8,
 	disks := make([]pkg.VMDisk, 1)
 	// installed disk
 	disks[0] = pkg.VMDisk{Path: diskPath, ReadOnly: false, Root: false}
-	cmdline := fmt.Sprintf("console=ttyS0 reboot=k panic=1 k3os.token=%s", cfg.PlainClusterSecret)
 
 	kubevm := pkg.VM{
 		Name:        name,
@@ -285,7 +289,7 @@ func (p *Provisioner) kubernetesRun(ctx context.Context, name string, cpu uint8,
 		Network:     networkInfo,
 		KernelImage: imagePath + "/k3os-vmlinux",
 		InitrdImage: imagePath + "/k3os-initrd-amd64",
-		KernelArgs:  cmdline,
+		KernelArgs:  "console=ttyS0 reboot=k panic=1",
 		Disks:       disks,
 	}
 
@@ -296,7 +300,6 @@ func (p *Provisioner) kubernetesDecomission(ctx context.Context, reservation *pr
 	var (
 		storage = stubs.NewVDiskModuleStub(p.zbus)
 		network = stubs.NewNetworkerStub(p.zbus)
-		flist   = stubs.NewFlisterStub(p.zbus)
 		vm      = stubs.NewVMModuleStub(p.zbus)
 
 		cfg Kubernetes
@@ -318,18 +321,13 @@ func (p *Provisioner) kubernetesDecomission(ctx context.Context, reservation *pr
 	}
 
 	if cfg.PublicIP != 0 {
-		if err := network.RemovePubTap(netID); err != nil {
+		if err := network.RemovePubTap(pubIPResID(cfg.PublicIP)); err != nil {
 			return errors.Wrap(err, "could not clean up public tap device")
 		}
 	}
 
 	if err := storage.Deallocate(fmt.Sprintf("%s-%s", reservation.ID, "vda")); err != nil {
 		return errors.Wrap(err, "could not remove vDisk")
-	}
-
-	// Unmount flist, skip error if any.
-	if err := flist.NamedUmount(reservation.ID); err != nil {
-		log.Err(err).Msg("could not unmount flist")
 	}
 
 	return nil
@@ -390,16 +388,18 @@ func (p *Provisioner) buildNetworkInfo(ctx context.Context, rversion int, userID
 	if cfg.PublicIP != 0 {
 		// A public ip is set, load the reservation, extract the ip and make a config
 		// for it
-		// TODO: proper firewalling on the host
 
 		pubIP, pubGw, err := p.getPubIPConfig(cfg.PublicIP)
 		if err != nil {
 			return pkg.VMNetworkInfo{}, errors.Wrap(err, "could not get public ip config")
 		}
 
+		// this needs to be the same as how we get it in the actual IP reservation
+		mac := ifaceutil.HardwareAddrFromInputBytes(pubIP.IP.To4())
+
 		iface := pkg.VMIface{
 			Tap:            pubIface,
-			MAC:            "", // static ip is set so not important
+			MAC:            mac.String(), // mac so we always get the same IPv6 from slaac
 			IP4AddressCIDR: pubIP,
 			IP4GatewayIP:   pubGw,
 			// for now we get ipv6 from slaac, so leave ipv6 stuffs this empty
@@ -512,7 +512,15 @@ func vmSize(size uint8) (cpu uint8, memory uint64, storage uint64, err error) {
 	case 17:
 		//4 vCpu, 8 GiB RAM, 50 GB disk
 		return 4, 8 * 1024, 50 * 1024, nil
+	case 18:
+		//1 vCpu, 1 GiB RAM, 25 GB disk
+		return 1, 1 * 1024, 25 * 1024, nil
 	}
 
-	return 0, 0, 0, fmt.Errorf("unsupported vm size %d, only size 1 and 2 are supported", size)
+	return 0, 0, 0, fmt.Errorf("unsupported vm size %d, only size 1 to 18 are supported", size)
+}
+
+func pubIPResID(reservationID schema.ID) string {
+	// TODO: should this change in the actual reservation?
+	return fmt.Sprintf("%d-1", reservationID)
 }

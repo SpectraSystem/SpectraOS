@@ -399,7 +399,7 @@ func (n *networker) SetupTap(networkID pkg.NetID) (string, error) {
 		return "", errors.Wrap(err, "could not get network namespace bridge")
 	}
 
-	tapIface, err := tapName(networkID, false)
+	tapIface, err := tapName(networkID)
 	if err != nil {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -412,7 +412,7 @@ func (n *networker) SetupTap(networkID pkg.NetID) (string, error) {
 func (n *networker) TapExists(networkID pkg.NetID) (bool, error) {
 	log.Info().Str("network-id", string(networkID)).Msg("Checking if tap interface exists")
 
-	tapIface, err := tapName(networkID, false)
+	tapIface, err := tapName(networkID)
 	if err != nil {
 		return false, errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -424,7 +424,7 @@ func (n *networker) TapExists(networkID pkg.NetID) (bool, error) {
 func (n *networker) RemoveTap(networkID pkg.NetID) error {
 	log.Info().Str("network-id", string(networkID)).Msg("Removing tap interface")
 
-	tapIface, err := tapName(networkID, false)
+	tapIface, err := tapName(networkID)
 	if err != nil {
 		return errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -436,10 +436,11 @@ func (n *networker) PublicIPv4Support() bool {
 	return n.ndmz.SupportsPubIPv4()
 }
 
-// SetupPubTap sets up a tap device in the host namespace for the networkID. It is hooked
-// to the public bridge. The name of the tap interface is returned
-func (n *networker) SetupPubTap(networkID pkg.NetID) (string, error) {
-	log.Info().Str("network-id", string(networkID)).Msg("Setting up tap interface")
+// SetupPubTap sets up a tap device in the host namespace for the public ip
+// reservation id. It is hooked to the public bridge. The name of the tap
+// interface is returned
+func (n *networker) SetupPubTap(pubIPReservationID string) (string, error) {
+	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Setting up public tap interface")
 
 	if !n.ndmz.SupportsPubIPv4() {
 		return "", errors.New("can't create public tap on this node")
@@ -447,7 +448,7 @@ func (n *networker) SetupPubTap(networkID pkg.NetID) (string, error) {
 
 	bridgeName := n.ndmz.IP6PublicIface()
 
-	tapIface, err := tapName(networkID, true)
+	tapIface, err := pubTapName(pubIPReservationID)
 	if err != nil {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -458,10 +459,10 @@ func (n *networker) SetupPubTap(networkID pkg.NetID) (string, error) {
 }
 
 // PubTapExists checks if the tap device for the public network exists already
-func (n *networker) PubTapExists(networkID pkg.NetID) (bool, error) {
-	log.Info().Str("network-id", string(networkID)).Msg("Checking if public tap interface exists")
+func (n *networker) PubTapExists(pubIPReservationID string) (bool, error) {
+	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Checking if public tap interface exists")
 
-	tapIface, err := tapName(networkID, true)
+	tapIface, err := pubTapName(pubIPReservationID)
 	if err != nil {
 		return false, errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -471,15 +472,58 @@ func (n *networker) PubTapExists(networkID pkg.NetID) (bool, error) {
 
 // RemovePubTap removes the public tap device from the host namespace
 // of the networkID
-func (n *networker) RemovePubTap(networkID pkg.NetID) error {
-	log.Info().Str("network-id", string(networkID)).Msg("Removing public tap interface")
+func (n *networker) RemovePubTap(pubIPReservationID string) error {
+	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Removing public tap interface")
 
-	tapIface, err := tapName(networkID, true)
+	tapIface, err := pubTapName(pubIPReservationID)
 	if err != nil {
 		return errors.Wrap(err, "could not get network namespace tap device name")
 	}
 
 	return ifaceutil.Delete(tapIface, nil)
+}
+
+// DisconnectPubTap disconnects the public tap from the network. The interface
+// itself is not removed and will need to be cleaned up later
+func (n *networker) DisconnectPubTap(pubIPReservationID string) error {
+	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Disconnecting public tap interface")
+
+	tapIfaceName, err := pubTapName(pubIPReservationID)
+	if err != nil {
+		return errors.Wrap(err, "could not get network namespace tap device name")
+	}
+
+	tap, err := netlink.LinkByName(tapIfaceName)
+	if _, ok := err.(netlink.LinkNotFoundError); ok {
+		return nil
+	} else if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.Wrap(err, "could not load tap device")
+	}
+
+	return netlink.LinkSetNoMaster(tap)
+}
+
+// GetPublicIPv6Subnet returns the IPv6 prefix op the public subnet of the host
+func (n *networker) GetPublicIPv6Subnet() (net.IPNet, error) {
+	// TODO
+	pubIface, err := netlink.LinkByName(n.ndmz.IP6PublicIface())
+	if err != nil {
+		return net.IPNet{}, errors.Wrap(err, "could not load public interface")
+	}
+	// get the ipv6 address
+	addrs, err := netlink.AddrList(pubIface, netlink.FAMILY_V6)
+	if err != nil {
+		return net.IPNet{}, errors.Wrap(err, "could not load public interface ipv6 addresses")
+	}
+	for _, addr := range addrs {
+		if addr.IP.IsGlobalUnicast() && !isULA(addr.IP) {
+			return *addr.IPNet, nil
+		}
+	}
+	return net.IPNet{}, nil
 }
 
 // GetSubnet of a local network resource identified by the network ID, ipv4 and ipv6
@@ -1040,14 +1084,27 @@ func createNetNS(name string) (ns.NetNS, error) {
 }
 
 // tapName returns the name of the tap device for a network namespace
-func tapName(netID pkg.NetID, public bool) (string, error) {
-	ident := "t"
-	if public {
-		ident = "p"
-	}
-	name := fmt.Sprintf("%s-%s", ident, netID)
+func tapName(netID pkg.NetID) (string, error) {
+	name := fmt.Sprintf("t-%s", netID)
 	if len(name) > 15 {
 		return "", errors.Errorf("tap name too long %s", name)
 	}
 	return name, nil
+}
+
+func pubTapName(resID string) (string, error) {
+	name := fmt.Sprintf("p-%s", resID)
+	if len(name) > 15 {
+		return "", errors.Errorf("tap name too long %s", name)
+	}
+	return name, nil
+}
+
+var ulaPrefix = net.IPNet{
+	IP:   net.ParseIP("fc00::"),
+	Mask: net.CIDRMask(7, 128),
+}
+
+func isULA(ip net.IP) bool {
+	return ulaPrefix.Contains(ip)
 }
