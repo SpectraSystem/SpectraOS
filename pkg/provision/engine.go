@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/cenkalti/backoff/v3"
@@ -88,6 +89,9 @@ func New(opts EngineOps) (*Engine, error) {
 		return nil, errors.Wrap(err, "failed retrieve memory stats")
 	}
 
+	// we round the total memory size to the nearest 1G
+	totalMemory := math.Ceil(float64(memStats.Total)/gib) * gib
+
 	return &Engine{
 		nodeID:            opts.NodeID,
 		source:            opts.Source,
@@ -100,7 +104,7 @@ func New(opts EngineOps) (*Engine, error) {
 		zbusCl:            opts.ZbusCl,
 		janitor:           opts.Janitor,
 		memCache:          cache.New(30*time.Minute, 30*time.Second),
-		totalMemAvailable: memStats.Total - minimunZosMemory,
+		totalMemAvailable: uint64(totalMemory) - minimunZosMemory,
 	}, nil
 }
 
@@ -208,11 +212,6 @@ func (e *Engine) provision(ctx context.Context, r *Reservation) error {
 		return errors.Wrapf(err, "failed validation of reservation")
 	}
 
-	fn, ok := e.provisioners[r.Type]
-	if !ok {
-		return fmt.Errorf("type of reservation not supported: %s", r.Type)
-	}
-
 	if r.Reference != "" {
 		if err := e.migrateToPool(ctx, r); err != nil {
 			return err
@@ -244,7 +243,7 @@ func (e *Engine) provision(ctx context.Context, r *Reservation) error {
 		r.ID = r.Reference
 	}
 
-	returned, provisionError := e.provisionForward(ctx, fn, r)
+	returned, provisionError := e.provisionForward(ctx, r)
 
 	result, err := e.buildResult(realID, r.Type, provisionError, returned)
 	if err != nil {
@@ -300,7 +299,12 @@ func (e *Engine) provision(ctx context.Context, r *Reservation) error {
 	return nil
 }
 
-func (e *Engine) provisionForward(ctx context.Context, fn ProvisionerFunc, r *Reservation) (interface{}, error) {
+func (e *Engine) provisionForward(ctx context.Context, r *Reservation) (interface{}, error) {
+	fn, ok := e.provisioners[r.Type]
+	if !ok {
+		return nil, fmt.Errorf("type of reservation not supported: %s", r.Type)
+	}
+
 	if err := e.statser.CheckMemoryRequirements(r, e.totalMemAvailable); err != nil {
 		return nil, errors.Wrapf(err, "failed to apply provision")
 	}
@@ -322,10 +326,6 @@ func (e *Engine) provisionForward(ctx context.Context, fn ProvisionerFunc, r *Re
 }
 
 func (e *Engine) decommission(ctx context.Context, r *Reservation) error {
-	fn, ok := e.decomissioners[r.Type]
-	if !ok {
-		return fmt.Errorf("type of reservation not supported: %s", r.Type)
-	}
 
 	exists, err := e.cache.Exists(r.ID)
 	if err != nil {
@@ -359,9 +359,12 @@ func (e *Engine) decommission(ctx context.Context, r *Reservation) error {
 		return nil
 	}
 
-	err = fn(ctx, r)
-	if err != nil {
-		return errors.Wrap(err, "decommissioning of reservation failed")
+	if fn, ok := e.decomissioners[r.Type]; ok {
+		if err := fn(ctx, r); err != nil {
+			return errors.Wrap(err, "decommissioning of reservation failed")
+		}
+	} else {
+		log.Error().Str("type", string(r.Type)).Msg("type of reservation not supported")
 	}
 
 	r.ID = realID

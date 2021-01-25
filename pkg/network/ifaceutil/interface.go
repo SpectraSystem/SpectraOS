@@ -166,6 +166,11 @@ func MakeVethPair(name, master string, mtu int) (netlink.Link, error) {
 		return nil, err
 	}
 
+	// make sure the lowerhalf is up, this automatically sets the upperhalf UP
+	if err = netlink.LinkSetUp(peerLink); err != nil {
+		return nil, errors.Wrap(err, "could not set veth peer up")
+	}
+
 	// Re-fetch the link to get its creation-time parameters, e.g. index and mac
 	veth2, err := netlink.LinkByName(name)
 	if err != nil {
@@ -288,7 +293,7 @@ func Delete(name string, netNS ns.NetNS) error {
 
 // HostIPV6Iface return the first physical interface to have an
 // ipv6 public address
-func HostIPV6Iface() (string, error) {
+func HostIPV6Iface(useZos bool) (string, error) {
 
 	links, err := netlink.LinkList()
 	if err != nil {
@@ -302,7 +307,9 @@ func HostIPV6Iface() (string, error) {
 	// first check all physical interface
 	links = LinkFilter(links, []string{"device"})
 	// then check zos bridge
-	links = append(links, zos)
+	if useZos {
+		links = append(links, zos)
+	}
 
 	for _, link := range links {
 
