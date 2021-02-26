@@ -11,4 +11,8 @@ const (
 	// DefaultBridge is the name of the default bridge created
 	// by the bootstrap of networkd
 	DefaultBridge = "zos"
+	//PublicBridge name
+	PublicBridge = "br-pub"
+	//YggBridge ygg bridge
+	YggBridge = "br-ygg"
 )
