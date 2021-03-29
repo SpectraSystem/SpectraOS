@@ -13,6 +13,7 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/threefoldtech/zos/pkg/cache"
+	"github.com/threefoldtech/zos/pkg/network/macvtap"
 	"github.com/threefoldtech/zos/pkg/network/ndmz"
 	"github.com/threefoldtech/zos/pkg/network/public"
 	"github.com/threefoldtech/zos/pkg/network/tuntap"
@@ -68,13 +69,13 @@ type networker struct {
 
 	publicConfig string
 	ndmz         ndmz.DMZ
-	ygg          *yggdrasil.Server
+	ygg          *YggServer
 }
 
 var _ pkg.Networker = (*networker)(nil)
 
 // NewNetworker create a new pkg.Networker that can be used over zbus
-func NewNetworker(identity pkg.IdentityManager, publicCfgPath string, ndmz ndmz.DMZ, ygg *yggdrasil.Server) (pkg.Networker, error) {
+func NewNetworker(identity pkg.IdentityManager, publicCfgPath string, ndmz ndmz.DMZ, ygg *YggServer) (pkg.Networker, error) {
 	vd, err := cache.VolatileDir("networkd", 50*mib)
 	if err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("failed to create networkd cache directory: %w", err)
@@ -422,7 +423,8 @@ func (n *networker) SetupPubTap(pubIPReservationID string) (string, error) {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
 	}
 
-	_, err = tuntap.CreateTap(tapIface, public.PublicBridge)
+	hw := ifaceutil.HardwareAddrFromInputBytes([]byte(pubIPReservationID))
+	_, err = macvtap.CreateMACvTap(tapIface, public.PublicBridge, hw)
 
 	return tapIface, err
 }
@@ -472,7 +474,9 @@ func (n *networker) DisconnectPubTap(pubIPReservationID string) error {
 		return errors.Wrap(err, "could not load tap device")
 	}
 
-	return netlink.LinkSetNoMaster(tap)
+	//setting the txqueue on a macvtap will prevent traffic from
+	//going over the device, effectively disconnecting it.
+	return netlink.LinkSetTxQLen(tap, 0)
 }
 
 // GetPublicIPv6Subnet returns the IPv6 prefix op the public subnet of the host

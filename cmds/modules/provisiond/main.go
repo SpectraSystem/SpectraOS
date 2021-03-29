@@ -14,6 +14,7 @@ import (
 	"github.com/rusart/muxprom"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/app"
+	"github.com/threefoldtech/zos/pkg/capacity"
 	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 	"github.com/threefoldtech/zos/pkg/primitives"
@@ -63,7 +64,7 @@ var Module cli.Command = cli.Command{
 func action(cli *cli.Context) error {
 	var (
 		msgBrokerCon string = cli.String("broker")
-		storageDir   string = cli.String("root")
+		rootDir      string = cli.String("root")
 		httpAddr     string = cli.String("http")
 	)
 
@@ -75,7 +76,7 @@ func action(cli *cli.Context) error {
 		}
 	}
 
-	if err := os.MkdirAll(storageDir, 0770); err != nil {
+	if err := os.MkdirAll(rootDir, 0770); err != nil {
 		return errors.Wrap(err, "failed to create cache directory")
 	}
 
@@ -119,33 +120,51 @@ func action(cli *cli.Context) error {
 		log.Error().Err(err).Msg("networkd is not ready yet")
 	})
 
+	router := mux.NewRouter().StrictSlash(true)
+
+	prom := muxprom.New(
+		muxprom.Router(router),
+		muxprom.Namespace("provision"),
+	)
+	prom.Instrument()
+
+	// the v1 endpoint will be used by all components to register endpoints
+	// that are specific for that component
+	v1 := router.PathPrefix("/api/v1").Subrouter()
+
 	// keep track of resource units reserved and amount of workloads provisionned
 
 	// to store reservation locally on the node
-	store, err := storage.NewFSStore(filepath.Join(storageDir, "workloads"))
+	store, err := storage.NewFSStore(filepath.Join(rootDir, "workloads"))
 	if err != nil {
 		return errors.Wrap(err, "failed to create local reservation store")
 	}
 
-	const daemonBootFlag = "provisiond"
+	provisioners := primitives.NewPrimitivesProvisioner(cl)
+
 	// update initial capacity with
 	reserved, err := getNodeReserved(cl)
 	if err != nil {
 		return errors.Wrap(err, "failed to get node reserved capacity")
 	}
+	cap, err := capacity.NewResourceOracle(stubs.NewStorageModuleStub(cl)).Total()
+	if err != nil {
+		return errors.Wrap(err, "failed to get node capacity")
+	}
 
-	handlers := primitives.NewPrimitivesProvisioner(cl)
-	/* --- committer
-	 *   --- cache
-	 *	   --- statistics
-	 *	     --- handlers
-	 */
-	provisioner := primitives.NewStatisticsProvisioner(
-		primitives.Counters{},
+	// statistics collects information about workload statistics
+	// also does some checks on capacity
+	statistics := primitives.NewStatistics(
+		cap,
 		reserved,
 		nodeID.Identity(),
-		handlers,
+		provisioners,
 	)
+
+	// add endpoint for statistics
+	if err := primitives.NewStatisticsAPI(v1, statistics); err != nil {
+		return errors.Wrap(err, "failed to create statistics api")
+	}
 
 	// TODO: that is a test user map for development, do not commit
 	// users := mw.NewUserMap()
@@ -163,7 +182,7 @@ func action(cli *cli.Context) error {
 
 	engine := provision.New(
 		store,
-		provisioner,
+		statistics,
 		provision.WithUsers(users),
 		provision.WithAdmins(admins),
 		// set priority to some reservation types on boot
@@ -189,15 +208,28 @@ func action(cli *cli.Context) error {
 	ctx, _ = utils.WithSignal(ctx)
 
 	// call the runtime upgrade before running engine
-	handlers.RuntimeUpgrade(ctx)
+	provisioners.RuntimeUpgrade(ctx)
 
+	// spawn the entine
 	go func() {
 		if err := engine.Run(ctx); err != nil && err != context.Canceled {
 			log.Fatal().Err(err).Msg("provision engine exited unexpectedely")
 		}
 	}()
 
-	// starts zbus server in the back ground
+	reporter, err := NewReported(store, identity, filepath.Join(rootDir, "reports"))
+	if err != nil {
+		return errors.Wrap(err, "failed to setup capacity reporter")
+	}
+	// also spawn the capacity reporter
+	go func() {
+		if err := reporter.Run(ctx); err != nil && err != context.Canceled {
+			log.Fatal().Err(err).Msg("capacity reported stopped unexpectedely")
+		}
+		log.Info().Msg("capacity reported stopped")
+	}()
+
+	// and start the zbus server in the back ground
 	go func() {
 		if err := server.Run(ctx); err != nil && err != context.Canceled {
 			log.Fatal().Err(err).Msg("zbus provision engine api exited unexpectedely")
@@ -205,11 +237,15 @@ func action(cli *cli.Context) error {
 		log.Info().Msg("zbus server stopped")
 	}()
 
-	httpServer, err := getHTTPServer(cl, engine)
-	if err != nil {
+	if err := setupAPIs(v1, cl, engine); err != nil {
 		return errors.Wrap(err, "failed to initialize API")
 	}
-	httpServer.Addr = httpAddr
+
+	httpServer := &http.Server{
+		Addr:    httpAddr,
+		Handler: router,
+	}
+
 	utils.OnDone(ctx, func(_ error) {
 		log.Info().Msg("shutting down")
 		httpServer.Close()
@@ -240,33 +276,22 @@ func getNodeReserved(cl zbus.Client) (counter primitives.Counters, err error) {
 		return counter, fmt.Errorf("unknown cache disk type '%s'", fs.DiskType)
 	}
 
-	v.Increment(fs.Usage.Size)
-	counter.MRU.Increment(2 * gib)
+	v.Increment(fs.Usage.Size / gib)
+	counter.MRU.Increment(2)
 	return
 }
 
-func getHTTPServer(cl zbus.Client, engine provision.Engine) (*http.Server, error) {
-	router := mux.NewRouter().StrictSlash(true)
-
-	prom := muxprom.New(
-		muxprom.Router(router),
-		muxprom.Namespace("provision"),
-	)
-	prom.Instrument()
-
-	v1 := router.PathPrefix("/api/v1").Subrouter()
+func setupAPIs(v1 *mux.Router, cl zbus.Client, engine provision.Engine) error {
 
 	_, err := api.NewWorkloadsAPI(v1, engine)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to setup workload api")
+		return errors.Wrap(err, "failed to setup workload api")
 	}
 
 	_, err = api.NewNetworkAPI(v1, engine, cl)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to setup network api")
+		return errors.Wrap(err, "failed to setup network api")
 	}
 
-	return &http.Server{
-		Handler: router,
-	}, nil
+	return nil
 }
