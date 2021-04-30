@@ -5,8 +5,11 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
 	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/gridtypes"
+	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 	"github.com/threefoldtech/zos/pkg/provision"
 	"github.com/threefoldtech/zos/pkg/provision/mw"
 	"github.com/threefoldtech/zos/pkg/stubs"
@@ -34,7 +37,7 @@ func (n *Network) setup(router *mux.Router) error {
 	api := router.PathPrefix("/network").Subrouter()
 	// public network api
 	api.Path("/wireguard").HandlerFunc(mw.AsHandlerFunc(n.listPorts)).Name("network-wireguard-list")
-
+	api.Path("/publicips").HandlerFunc(mw.AsHandlerFunc(n.listPublicIps)).Name("network-publicips-list")
 	config := api.PathPrefix("/config").Subrouter()
 	config.Path("/public").Methods(http.MethodGet).HandlerFunc(mw.AsHandlerFunc(n.getPublicConfig)).Name("network-get-public-config")
 	// set config calls requires admin
@@ -49,7 +52,7 @@ func (n *Network) setup(router *mux.Router) error {
 }
 
 func (n *Network) listPorts(request *http.Request) (interface{}, mw.Response) {
-	ports, err := stubs.NewNetworkerStub(n.cl).WireguardPorts()
+	ports, err := stubs.NewNetworkerStub(n.cl).WireguardPorts(request.Context())
 	if err != nil {
 		return nil, mw.Error(err)
 	}
@@ -57,8 +60,53 @@ func (n *Network) listPorts(request *http.Request) (interface{}, mw.Response) {
 	return ports, nil
 }
 
+func (n *Network) listPublicIps(request *http.Request) (interface{}, mw.Response) {
+	storage := n.engine.Storage()
+	// for efficiency this method should just find out configured public Ips.
+	// but currently the only way to do this is by scanning the nft rules
+	// a nother less efficient but good for now solution is to scan all
+	// reservations and find the ones with public IPs.
+
+	twins, err := storage.Twins()
+	if err != nil {
+		return nil, mw.Error(errors.Wrap(err, "failed to list twins"))
+	}
+	ips := make([]string, 0)
+	for _, twin := range twins {
+		deploymentsIDs, err := storage.ByTwin(twin)
+		if err != nil {
+			return nil, mw.Error(errors.Wrap(err, "failed to list twin deployment"))
+		}
+		for _, id := range deploymentsIDs {
+			deployment, err := storage.Get(twin, id)
+			if err != nil {
+				return nil, mw.Error(errors.Wrap(err, "failed to load deployment"))
+			}
+			workloads := deployment.ByType(zos.PublicIPType)
+
+			for _, workload := range workloads {
+				if workload.Result.State != gridtypes.StateOk {
+					continue
+				}
+
+				data, err := workload.WorkloadData()
+				if err != nil {
+					return nil, mw.Error(err)
+				}
+
+				ip, _ := data.(*zos.PublicIP)
+				if ip.IP.IP != nil {
+					ips = append(ips, ip.IP.String())
+				}
+			}
+		}
+	}
+
+	return ips, nil
+}
+
 func (n *Network) getPublicConfig(request *http.Request) (interface{}, mw.Response) {
-	cfg, err := stubs.NewNetworkerStub(n.cl).GetPublicConfig()
+	cfg, err := stubs.NewNetworkerStub(n.cl).GetPublicConfig(request.Context())
 	if err != nil {
 		return nil, mw.NotFound(err)
 	}
@@ -73,7 +121,7 @@ func (n *Network) setPublicConfig(request *http.Request) (interface{}, mw.Respon
 		return nil, mw.BadRequest(err)
 	}
 
-	err := stubs.NewNetworkerStub(n.cl).SetPublicConfig(cfg)
+	err := stubs.NewNetworkerStub(n.cl).SetPublicConfig(request.Context(), cfg)
 	if err != nil {
 		return nil, mw.Error(err)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/threefoldtech/zos/pkg/network/tuntap"
 	"github.com/threefoldtech/zos/pkg/network/wireguard"
 	"github.com/threefoldtech/zos/pkg/network/yggdrasil"
+	"github.com/threefoldtech/zos/pkg/stubs"
 
 	"github.com/vishvananda/netlink"
 
@@ -62,7 +64,7 @@ var (
 )
 
 type networker struct {
-	identity     pkg.IdentityManager
+	identity     *stubs.IdentityManagerStub
 	networkDir   string
 	ipamLeaseDir string
 	portSet      *set.UIntSet
@@ -75,7 +77,7 @@ type networker struct {
 var _ pkg.Networker = (*networker)(nil)
 
 // NewNetworker create a new pkg.Networker that can be used over zbus
-func NewNetworker(identity pkg.IdentityManager, publicCfgPath string, ndmz ndmz.DMZ, ygg *YggServer) (pkg.Networker, error) {
+func NewNetworker(identity *stubs.IdentityManagerStub, publicCfgPath string, ndmz ndmz.DMZ, ygg *YggServer) (pkg.Networker, error) {
 	vd, err := cache.VolatileDir("networkd", 50*mib)
 	if err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("failed to create networkd cache directory: %w", err)
@@ -454,6 +456,80 @@ func (n *networker) RemovePubTap(pubIPReservationID string) error {
 	return ifaceutil.Delete(tapIface, nil)
 }
 
+// SetupPubIPFilter sets up filter for this public ip
+func (n *networker) SetupPubIPFilter(filterName string, iface string, ip string, ipv6 string, mac string) error {
+	if n.PubIPFilterExists(filterName) {
+		return nil
+	}
+
+	//TODO: use nft.Apply
+	cmd := exec.Command("/bin/sh", "-c",
+		fmt.Sprintf(`# add vm
+# add a chain for the vm public interface in arp and bridge
+nft 'add chain arp filter %[1]s'
+nft 'add chain bridge filter %[1]s'
+
+# make nft jump to vm chain
+nft 'add rule arp filter input iifname "%[2]s" jump %[1]s'
+nft 'add rule bridge filter forward iifname "%[2]s" jump %[1]s'
+
+# arp rule for vm
+nft 'add rule arp filter %[1]s arp operation reply arp saddr ip . arp saddr ether != { %[3]s . %[4]s } drop'
+
+# filter on L2 fowarding of non-matching ip/mac, drop RA,dhcpv6,dhcp
+nft 'add rule bridge filter %[1]s ip saddr . ether saddr != { %[3]s . %[4]s } counter drop'
+nft 'add rule bridge filter %[1]s ip6 saddr . ether saddr != { %[5]s . %[4]s } counter drop'
+nft 'add rule bridge filter %[1]s icmpv6 type nd-router-advert drop'
+nft 'add rule bridge filter %[1]s ip6 version 6 udp sport 547 drop'
+nft 'add rule bridge filter %[1]s ip version 4 udp sport 67 drop'`, filterName, iface, ip, mac, ipv6))
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.Wrapf(err, "could not setup firewall rules for public ip\n%s", string(output))
+	}
+
+	return nil
+}
+
+// PubIPFilterExists checks if pub ip filter
+func (n *networker) PubIPFilterExists(filterName string) bool {
+	cmd := exec.Command(
+		"/bin/sh",
+		"-c",
+		fmt.Sprintf(`nft list table bridge filter | grep "chain %s"`, filterName),
+	)
+	err := cmd.Run()
+	return err == nil
+}
+
+// RemovePubIPFilter removes the filter setted up by SetupPubIPFilter
+func (n *networker) RemovePubIPFilter(filterName string) error {
+	cmd := exec.Command("/bin/sh", "-c",
+		fmt.Sprintf(`# in bridge table
+nft 'flush chain bridge filter %[1]s'
+# jump to chain rule
+a=$( nft -a list table bridge filter | awk '/jump %[1]s/{ print $NF}' )
+nft 'delete rule bridge filter forward handle '${a}
+# chain itself
+a=$( nft -a list table bridge filter | awk '/chain %[1]s/{ print $NF}' )
+nft 'delete chain bridge filter handle '${a}
+
+# in arp table
+nft 'flush chain arp filter %[1]s'
+# jump to chain rule
+a=$( nft -a list table arp filter | awk '/jump %[1]s/{ print $NF}' )
+nft 'delete rule arp filter input handle '${a}
+# chain itself
+a=$( nft -a list table arp filter | awk '/chain %[1]s/{ print $NF}' )
+nft 'delete chain arp filter handle '${a}`, filterName))
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.Wrapf(err, "could not tear down firewall rules for public ip\n%s", string(output))
+	}
+	return nil
+}
+
 // DisconnectPubTap disconnects the public tap from the network. The interface
 // itself is not removed and will need to be cleaned up later
 func (n *networker) DisconnectPubTap(pubIPReservationID string) error {
@@ -648,7 +724,7 @@ func (n *networker) CreateNR(netNR pkg.Network) (string, error) {
 		var wg *wireguard.Wireguard
 		wg, err = public.NewWireguard(wgName)
 		if err != nil {
-			return "", errors.Wrapf(err, "failed to create wg interface for network resource '%s'", netNR.Name)
+			return "", errors.Wrapf(err, "failed to create wg interface for network resource '%s'", netNR.NetID)
 		}
 		if err = netr.SetWireguard(wg); err != nil {
 			return "", errors.Wrap(err, "failed to setup wireguard interface for network resource")
@@ -659,7 +735,7 @@ func (n *networker) CreateNR(netNR pkg.Network) (string, error) {
 		return "", errors.Wrapf(err, "failed to attach network resource to DMZ bridge")
 	}
 
-	if err = netr.ConfigureWG(netNR.WGPrivateKeyPlain); err != nil {
+	if err = netr.ConfigureWG(netNR.WGPrivateKey); err != nil {
 		return "", errors.Wrap(err, "failed to configure network resource")
 	}
 
@@ -719,7 +795,7 @@ func (n *networker) DeleteNR(netNR pkg.Network) error {
 
 // Set node public namespace config
 func (n *networker) SetPublicConfig(cfg pkg.PublicConfig) error {
-	id := n.identity.NodeID()
+	id := n.identity.NodeID(context.Background())
 	_, err := public.EnsurePublicSetup(id, &cfg)
 	if err != nil {
 		return err
@@ -770,10 +846,6 @@ func (n *networker) networkOf(id string) (nr pkg.Network, err error) {
 		}
 	} else {
 		return nr, fmt.Errorf("unknown network object version (%s)", version)
-	}
-
-	if err := net.Valid(); err != nil {
-		return net, errors.Wrapf(err, "failed to validate cached network resource: %s", net.NetID)
 	}
 
 	return net, nil

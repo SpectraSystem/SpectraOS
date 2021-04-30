@@ -16,6 +16,7 @@ import (
 	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/capacity"
 	"github.com/threefoldtech/zos/pkg/environment"
+	"github.com/threefoldtech/zos/pkg/gridtypes"
 	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 	"github.com/threefoldtech/zos/pkg/primitives"
 	"github.com/threefoldtech/zos/pkg/provision/api"
@@ -102,7 +103,7 @@ func action(cli *cli.Context) error {
 	}
 
 	identity := stubs.NewIdentityManagerStub(cl)
-	nodeID := identity.NodeID()
+	nodeID := identity.NodeID(cli.Context)
 
 	// block until networkd is ready to serve request from zbus
 	// this is used to prevent uptime and online status to the explorer if the node is not in a fully ready
@@ -115,7 +116,7 @@ func action(cli *cli.Context) error {
 	bo := backoff.NewExponentialBackOff()
 	bo.MaxElapsedTime = 0
 	backoff.RetryNotify(func() error {
-		return network.Ready()
+		return network.Ready(cli.Context)
 	}, bo, func(err error, d time.Duration) {
 		log.Error().Err(err).Msg("networkd is not ready yet")
 	})
@@ -131,7 +132,6 @@ func action(cli *cli.Context) error {
 	// the v1 endpoint will be used by all components to register endpoints
 	// that are specific for that component
 	v1 := router.PathPrefix("/api/v1").Subrouter()
-
 	// keep track of resource units reserved and amount of workloads provisionned
 
 	// to store reservation locally on the node
@@ -152,10 +152,26 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to get node capacity")
 	}
 
+	var current gridtypes.Capacity
+	if !app.IsFirstBoot(module) {
+		// if this is the first boot of this module.
+		// it means the provision engine will still
+		// rerun all deployments, which means we don't need
+		// to set the current consumed capacity from store
+		// since the counters will get populated anyway.
+		// but if not, we need to set the current counters
+		// from store.
+		current, err = store.Capacity()
+		if err != nil {
+			log.Error().Err(err).Msg("failed to compute current consumed capacity")
+		}
+	}
+
 	// statistics collects information about workload statistics
 	// also does some checks on capacity
 	statistics := primitives.NewStatistics(
 		cap,
+		current,
 		reserved,
 		nodeID.Identity(),
 		provisioners,
@@ -168,9 +184,9 @@ func action(cli *cli.Context) error {
 
 	// TODO: that is a test user map for development, do not commit
 	// users := mw.NewUserMap()
-	// users.AddKeyFromHex(gridtypes.ID("1"), "95d1ba20e9f5cb6cfc6182fecfa904664fb1953eba520db454d5d5afaa82d791")
+	// users.AddKeyFromHex(1, "95d1ba20e9f5cb6cfc6182fecfa904664fb1953eba520db454d5d5afaa82d791")
 
-	users, err := substrate.NewSubstrateUsers(env.SubstrateURL)
+	users, err := substrate.NewSubstrateTwins(env.SubstrateURL)
 	if err != nil {
 		return errors.Wrap(err, "failed to create substrate users database")
 	}
@@ -180,10 +196,16 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to create substrate admins database")
 	}
 
-	engine := provision.New(
+	queues := filepath.Join(rootDir, "queues")
+	if err := os.MkdirAll(queues, 0755); err != nil {
+		return errors.Wrap(err, "failed to create storage for queues")
+	}
+
+	engine, err := provision.New(
 		store,
 		statistics,
-		provision.WithUsers(users),
+		queues,
+		provision.WithTwins(users),
 		provision.WithAdmins(admins),
 		// set priority to some reservation types on boot
 		// so we always need to make sure all volumes and networks
@@ -191,7 +213,11 @@ func action(cli *cli.Context) error {
 		provision.WithStartupOrder(
 			zos.VolumeType,
 			zos.NetworkType,
+			zos.PublicIPType,
 		),
+		// if this is a node reboot, the node needs to
+		// recreate all reservations. so we set rerun = true
+		provision.WithRerunAll(app.IsFirstBoot(module)),
 	)
 
 	if err != nil {
@@ -217,7 +243,11 @@ func action(cli *cli.Context) error {
 		}
 	}()
 
-	reporter, err := NewReported(store, identity, filepath.Join(rootDir, "reports"))
+	if err := app.MarkBooted(module); err != nil {
+		log.Error().Err(err).Msg("failed to mark module as booted")
+	}
+
+	reporter, err := NewReported(store, identity, queues)
 	if err != nil {
 		return errors.Wrap(err, "failed to setup capacity reporter")
 	}
@@ -241,6 +271,8 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to initialize API")
 	}
 
+	// register static files
+	v1.PathPrefix("").Handler(http.StripPrefix("/api/v1", http.FileServer(http.FS(swaggerFs))))
 	httpServer := &http.Server{
 		Addr:    httpAddr,
 		Handler: router,
@@ -261,7 +293,7 @@ func action(cli *cli.Context) error {
 
 func getNodeReserved(cl zbus.Client) (counter primitives.Counters, err error) {
 	storage := stubs.NewStorageModuleStub(cl)
-	fs, err := storage.GetCacheFS()
+	fs, err := storage.GetCacheFS(context.TODO())
 	if err != nil {
 		return counter, err
 	}

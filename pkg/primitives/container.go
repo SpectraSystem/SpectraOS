@@ -31,18 +31,19 @@ type Container = zos.Container
 // ContainerResult type alias
 type ContainerResult = zos.ContainerResult
 
-func (p *Primitives) containerProvision(ctx context.Context, wl *gridtypes.Workload) (interface{}, error) {
+func (p *Primitives) containerProvision(ctx context.Context, wl *gridtypes.WorkloadWithID) (interface{}, error) {
 	return p.containerProvisionImpl(ctx, wl)
 }
 
 // ContainerProvision is entry point to container reservation
-func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.Workload) (ContainerResult, error) {
+func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.WorkloadWithID) (ContainerResult, error) {
+	deployement := provision.GetDeployment(ctx)
 	var (
 		containerClient = stubs.NewContainerModuleStub(p.zbus)
 		flistClient     = stubs.NewFlisterStub(p.zbus)
 		storageClient   = stubs.NewStorageModuleStub(p.zbus)
 		networkMgr      = stubs.NewNetworkerStub(p.zbus)
-		tenantNS        = fmt.Sprintf("ns%s", wl.User)
+		tenantNS        = fmt.Sprintf("ns%d", deployement.TwinID)
 		containerID     = wl.ID
 	)
 
@@ -52,40 +53,37 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 	}
 
 	// check if workload is already deployed
-	_, err := containerClient.Inspect(tenantNS, pkg.ContainerID(containerID))
+	_, err := containerClient.Inspect(ctx, tenantNS, pkg.ContainerID(containerID))
 	if err == nil {
-		log.Info().Stringer("id", containerID).Msg("container already deployed")
-		return ContainerResult{
-			ID:   string(containerID),
-			IPv4: config.Network.IPs[0].String(),
-		}, nil
+		return ContainerResult{}, provision.ErrDidNotChange
 	}
 
 	if err := validateContainerConfig(config); err != nil {
 		return ContainerResult{}, errors.Wrap(err, "container provision schema not valid")
 	}
+	deployment := provision.GetDeployment(ctx)
 
-	netID := zos.NetworkID(wl.User.String(), config.Network.NetworkID)
+	netID := zos.NetworkID(deployment.TwinID, config.Network.Network)
 	log.Debug().
 		Str("network-id", string(netID)).
 		Str("config", fmt.Sprintf("%+v", config)).
 		Msg("deploying network")
 
 		// check to make sure the network is already installed on the node
-	if _, err := networkMgr.GetSubnet(netID); err != nil {
-		return ContainerResult{}, fmt.Errorf("network %s is not installed on this node", config.Network.NetworkID)
+	if _, err := networkMgr.GetSubnet(ctx, netID); err != nil {
+		return ContainerResult{}, fmt.Errorf("network %s is not installed on this node", config.Network.Network)
 	}
 
-	cache := provision.GetEngine(ctx).Storage()
+	//cache := provision.GetEngine(ctx).Storage()
+
 	// check to make sure the requested volume are accessible
 	for _, mount := range config.Mounts {
-		volumeRes, err := cache.Get(gridtypes.ID(mount.VolumeID))
+		volume, err := deployment.GetType(mount.Volume, zos.VolumeType)
 		if err != nil {
-			return ContainerResult{}, errors.Wrapf(err, "failed to retrieve the owner of volume %s", mount.VolumeID)
+			return ContainerResult{}, err
 		}
-
-		if volumeRes.User != wl.User {
-			return ContainerResult{}, fmt.Errorf("cannot use volume %s, user %s is not the owner of it", mount.VolumeID, wl.User)
+		if !volume.IsResult(gridtypes.StateOk) {
+			return ContainerResult{}, fmt.Errorf("volume '%s' is in wrong state", mount.Volume)
 		}
 	}
 
@@ -95,37 +93,13 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	for k, v := range config.SecretEnv {
-		v, err := p.decryptSecret(ctx, wl.User, v, wl.Version)
-		if err != nil {
-			return ContainerResult{}, errors.Wrapf(err, "failed to decrypt secret env var '%s'", k)
-		}
-		env = append(env, fmt.Sprintf("%s=%s", k, v))
-	}
-
 	var logs []logger.Logs
 	for _, log := range config.Logs {
-		stdout := log.Data.Stdout
-		stderr := log.Data.Stderr
-
-		if len(log.Data.SecretStdout) > 0 {
-			stdout, err = p.decryptSecret(ctx, wl.User, log.Data.SecretStdout, wl.Version)
-			if err != nil {
-				return ContainerResult{}, errors.Wrap(err, "failed to decrypt log.secret_stdout var")
-			}
-		}
-
-		if len(log.Data.SecretStderr) > 0 {
-			stderr, err = p.decryptSecret(ctx, wl.User, log.Data.SecretStderr, wl.Version)
-			if err != nil {
-				return ContainerResult{}, errors.Wrap(err, "failed to decrypt log.secret_stdout var")
-			}
-		}
 		logs = append(logs, logger.Logs{
 			Type: log.Type,
 			Data: logger.LogsRedis{
-				Stdout: stdout,
-				Stderr: stderr,
+				Stdout: log.Data.Stdout,
+				Stderr: log.Data.Stderr,
 			},
 		})
 	}
@@ -136,7 +110,7 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 		ips[i] = ip.String()
 	}
 	var join pkg.Member
-	join, err = networkMgr.Join(netID, containerID.String(), pkg.ContainerNetworkConfig{
+	join, err = networkMgr.Join(ctx, netID, containerID.String(), pkg.ContainerNetworkConfig{
 		IPs:         ips,
 		PublicIP6:   config.Network.PublicIP6,
 		YggdrasilIP: config.Network.YggdrasilIP,
@@ -153,7 +127,7 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 
 	defer func() {
 		if err != nil {
-			if err := networkMgr.Leave(netID, containerID.String()); err != nil {
+			if err := networkMgr.Leave(ctx, netID, containerID.String()); err != nil {
 				log.Error().Err(err).Msgf("failed leave container network namespace")
 			}
 		}
@@ -172,7 +146,7 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 	}
 
 	var mnt string
-	mnt, err = flistClient.NamedMount(FilesystemName(wl), config.FList, config.HubURL, rootfsMntOpt)
+	mnt, err = flistClient.NamedMount(ctx, FilesystemName(wl), config.FList, config.HubURL, rootfsMntOpt)
 	if err != nil {
 		return ContainerResult{}, err
 	}
@@ -184,19 +158,26 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 		elevated = true
 	}
 
+	//deployment := provision.GetDeployment(ctx)
 	// prepare mount info for volumes
 	var mounts []pkg.MountInfo
 	for _, mount := range config.Mounts {
 		// we make sure that mountpoint in config doesn't have relative parts
 		mountpoint := path.Join("/", mount.Mountpoint)
 
+		// volume, err := deployment.Get(mount.Volume)
 		if err := os.MkdirAll(path.Join(mnt, mountpoint), 0755); err != nil {
 			return ContainerResult{}, err
 		}
 		var source pkg.Filesystem
-		source, err = storageClient.Path(mount.VolumeID)
+		volume, err := deployment.GetType(mount.Volume, zos.VolumeType)
 		if err != nil {
-			return ContainerResult{}, errors.Wrapf(err, "failed to get the mountpoint path of the volume %s", mount.VolumeID)
+			return ContainerResult{}, errors.Wrap(err, "failed to get volume workload")
+		}
+
+		source, err = storageClient.Path(ctx, volume.ID.String())
+		if err != nil {
+			return ContainerResult{}, errors.Wrapf(err, "failed to get the mountpoint path of the volume '%s'", mount.Volume)
 		}
 
 		mounts = append(
@@ -210,11 +191,11 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 
 	defer func() {
 		if err != nil {
-			if err := containerClient.Delete(tenantNS, pkg.ContainerID(containerID)); err != nil {
+			if err := containerClient.Delete(ctx, tenantNS, pkg.ContainerID(containerID)); err != nil {
 				log.Error().Err(err).Stringer("container_id", containerID).Msg("error during delete of container")
 			}
 
-			if err := flistClient.Umount(mnt); err != nil {
+			if err := flistClient.Umount(ctx, mnt); err != nil {
 				log.Error().Err(err).Str("path", mnt).Msgf("failed to unmount")
 			}
 		}
@@ -222,6 +203,7 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 
 	var id pkg.ContainerID
 	id, err = containerClient.Run(
+		ctx,
 		tenantNS,
 		pkg.Container{
 			Name:   containerID.String(),
@@ -264,12 +246,13 @@ func (p *Primitives) containerProvisionImpl(ctx context.Context, wl *gridtypes.W
 	}, nil
 }
 
-func (p *Primitives) containerDecommission(ctx context.Context, wl *gridtypes.Workload) error {
+func (p *Primitives) containerDecommission(ctx context.Context, wl *gridtypes.WorkloadWithID) error {
+	deployment := provision.GetDeployment(ctx)
+
 	container := stubs.NewContainerModuleStub(p.zbus)
 	flist := stubs.NewFlisterStub(p.zbus)
 	networkMgr := stubs.NewNetworkerStub(p.zbus)
-
-	tenantNS := fmt.Sprintf("ns%s", wl.User)
+	tenantNS := fmt.Sprintf("ns%d", deployment.TwinID)
 	containerID := pkg.ContainerID(wl.ID)
 
 	var config Container
@@ -277,9 +260,9 @@ func (p *Primitives) containerDecommission(ctx context.Context, wl *gridtypes.Wo
 		return err
 	}
 
-	info, err := container.Inspect(tenantNS, containerID)
+	info, err := container.Inspect(ctx, tenantNS, containerID)
 	if err == nil {
-		if err := container.Delete(tenantNS, containerID); err != nil {
+		if err := container.Delete(ctx, tenantNS, containerID); err != nil {
 			return errors.Wrapf(err, "failed to delete container %s", containerID)
 		}
 
@@ -291,7 +274,7 @@ func (p *Primitives) containerDecommission(ctx context.Context, wl *gridtypes.Wo
 			}
 		}
 
-		if err := flist.Umount(rootFS); err != nil {
+		if err := flist.Umount(ctx, rootFS); err != nil {
 			return errors.Wrapf(err, "failed to unmount flist at %s", rootFS)
 		}
 
@@ -299,9 +282,9 @@ func (p *Primitives) containerDecommission(ctx context.Context, wl *gridtypes.Wo
 		log.Error().Err(err).Str("container", string(containerID)).Msg("failed to inspect container for decomission")
 	}
 
-	netID := zos.NetworkID(wl.User.String(), string(config.Network.NetworkID))
-	if _, err := networkMgr.GetSubnet(netID); err == nil { // simple check to make sure the network still exists on the node
-		if err := networkMgr.Leave(netID, string(containerID)); err != nil {
+	netID := zos.NetworkID(deployment.TwinID, string(config.Network.Network))
+	if _, err := networkMgr.GetSubnet(ctx, netID); err == nil { // simple check to make sure the network still exists on the node
+		if err := networkMgr.Leave(ctx, netID, string(containerID)); err != nil {
 			return errors.Wrap(err, "failed to delete container network namespace")
 		}
 	}
@@ -317,7 +300,7 @@ func (p *Primitives) waitContainerIP(ctx context.Context, ifaceName, namespace s
 
 	getIP := func() error {
 
-		ips, err := network.Addrs(ifaceName, namespace)
+		ips, err := network.Addrs(ctx, ifaceName, namespace)
 		if err != nil {
 			log.Debug().Err(err).Msg("not ip public found, waiting")
 			return err
@@ -349,7 +332,7 @@ func (p *Primitives) waitContainerIP(ctx context.Context, ifaceName, namespace s
 }
 
 func validateContainerConfig(config Container) error {
-	if config.Network.NetworkID == "" {
+	if config.Network.Network == "" {
 		return fmt.Errorf("network ID cannot be empty")
 	}
 

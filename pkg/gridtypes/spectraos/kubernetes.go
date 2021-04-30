@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/pkg/errors"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
 )
 
@@ -106,9 +107,9 @@ type Kubernetes struct {
 	// Size of the vm, this defines the amount of vCpu, memory, and the disk size
 	// Docs: docs/kubernetes/sizes.md
 	Size uint8 `json:"size"`
-	// NetworkID of the network namepsace in which to run the VM. The network
+	// Network of the network namepsace in which to run the VM. The network
 	// must be provisioned previously.
-	NetworkID NetID `json:"network_id"`
+	Network string `json:"network"`
 	// IP of the VM. The IP must be part of the subnet available in the network
 	// resource defined by the networkID on this node
 	IP net.IP `json:"ip"`
@@ -123,17 +124,23 @@ type Kubernetes struct {
 	// when it boots.
 	SSHKeys []string `json:"ssh_keys"`
 	// PublicIP points to a reservation for a public ip
-	PublicIP gridtypes.ID `json:"public_ip"`
-
-	// PlainClusterSecret plaintext secret
-	PlainClusterSecret string `json:"-"`
+	PublicIP string `json:"public_ip"`
 
 	DatastoreEndpoint     string `json:"datastore_endpoint"`
 	DisableDefaultIngress bool   `json:"disable_default_ingress"`
 }
 
 // Valid implementation
-func (k Kubernetes) Valid() error {
+func (k Kubernetes) Valid(getter gridtypes.WorkloadGetter) error {
+	wl, err := getter.Get(k.PublicIP)
+	if err != nil {
+		return fmt.Errorf("public ip is not found")
+	}
+
+	if wl.Type != PublicIPType {
+		return errors.Wrapf(err, "workload of name '%s' is not a public ip", k.PublicIP)
+	}
+
 	return nil
 }
 
@@ -145,7 +152,7 @@ func (k Kubernetes) Challenge(b io.Writer) error {
 	if _, err := fmt.Fprintf(b, "%s", k.ClusterSecret); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(b, "%s", k.NetworkID); err != nil {
+	if _, err := fmt.Fprintf(b, "%s", k.Network); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(b, "%s", k.IP.String()); err != nil {
@@ -161,7 +168,7 @@ func (k Kubernetes) Challenge(b io.Writer) error {
 			return err
 		}
 	}
-	if _, err := fmt.Fprintf(b, "%s", k.PublicIP.String()); err != nil {
+	if _, err := fmt.Fprintf(b, "%s", k.PublicIP); err != nil {
 		return err
 	}
 
