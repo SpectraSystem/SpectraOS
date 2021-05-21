@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/shirou/gopsutil/mem"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
+	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 	"github.com/threefoldtech/zos/pkg/provision"
 	"github.com/threefoldtech/zos/pkg/provision/mw"
 )
@@ -37,9 +38,14 @@ type Statistics struct {
 	total    gridtypes.Capacity
 	counters Counters
 	reserved Counters
-	mem      uint64
+	mem      gridtypes.Unit
 
 	nodeID string
+}
+
+// round the given value to the lowest gigabyte
+func roundTotalMemory(t gridtypes.Unit) gridtypes.Unit {
+	return gridtypes.Unit(math.Floor(float64(t)/float64(gridtypes.Gigabyte))) * gridtypes.Gigabyte
 }
 
 // NewStatistics creates a new statistics provisioner interceptor.
@@ -50,28 +56,38 @@ func NewStatistics(total, initial gridtypes.Capacity, reserved Counters, nodeID 
 		panic(err)
 	}
 
+	total.MRU = roundTotalMemory(total.MRU)
+
 	log.Debug().Msgf("initial used capacity %+v", initial)
 	var counters Counters
 	counters.Increment(initial)
-	ram := math.Ceil(float64(vm.Total) / (1024 * 1024 * 1024))
+
 	return &Statistics{
 		inner:    inner,
 		total:    total,
 		counters: counters,
 		reserved: reserved,
-		mem:      uint64(ram),
+		mem:      gridtypes.Unit(vm.Total),
 		nodeID:   nodeID,
 	}
 }
 
 // Current returns the current used capacity
 func (s *Statistics) Current() gridtypes.Capacity {
+	total, usable, err := s.getUsableMemoryBytes()
+
+	if err != nil {
+		panic("failed to get memory consumption")
+	}
+
+	used := total + s.reserved.MRU.Current() - usable
+
 	return gridtypes.Capacity{
-		CRU:   s.counters.CRU.Current() + s.reserved.CRU.Current(),
-		MRU:   s.counters.MRU.Current() + s.reserved.MRU.Current(),
+		CRU:   uint64(s.counters.CRU.Current() + s.reserved.CRU.Current()),
+		MRU:   used,
 		HRU:   s.counters.HRU.Current() + s.reserved.HRU.Current(),
 		SRU:   s.counters.SRU.Current() + s.reserved.SRU.Current(),
-		IPV4U: s.counters.IPv4.Current(),
+		IPV4U: uint64(s.counters.IPv4.Current()),
 	}
 }
 
@@ -80,14 +96,49 @@ func (s *Statistics) Total() gridtypes.Capacity {
 	return s.total
 }
 
-func (s *Statistics) hasEnoughCapacity(used *gridtypes.Capacity, required *gridtypes.Capacity) error {
+// getUsableMemoryBytes returns the usable free memory. this takes
+// into account the system reserved, actual available memory and the theorytical max reserved memory
+// by the workloads
+func (s *Statistics) getUsableMemoryBytes() (gridtypes.Unit, gridtypes.Unit, error) {
+	m, err := mem.VirtualMemory()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	reserved := s.reserved.MRU.Current()
+	// total is always the total - the reserved
+	total := s.total.MRU - reserved
+
+	// which means the available memory is always also
+	// is actual_available - reserved
+	var available gridtypes.Unit
+	if gridtypes.Unit(m.Available) > reserved {
+		available = gridtypes.Unit(m.Available) - reserved
+	}
+
+	// get reserved memory from current deployed workloads (theoretical max)
+	theoryticalUsed := s.counters.MRU.Current()
+	var theoryticalFree gridtypes.Unit // this is the (total - workload)
+	if total > theoryticalUsed {
+		theoryticalFree = total - theoryticalUsed
+	}
+
+	// usable is the min of actual available on the system or theoryticalFree
+	usable := gridtypes.Unit(math.Min(float64(theoryticalFree), float64(available)))
+	return total, usable, nil
+}
+
+func (s *Statistics) hasEnoughCapacity(required *gridtypes.Capacity) error {
 	// checks memory
-	if required.MRU+used.MRU > s.mem {
+	_, usable, err := s.getUsableMemoryBytes()
+	if err != nil {
+		return errors.Wrap(err, "failed to get available memory")
+	}
+	if required.MRU > usable {
 		return fmt.Errorf("cannot fulfil required memory size")
 	}
 
-	//check other as well?
-
+	//check other resources as well?
 	return nil
 }
 
@@ -99,7 +150,13 @@ func (s *Statistics) Provision(ctx context.Context, wl *gridtypes.WorkloadWithID
 		return nil, errors.Wrap(err, "failed to calculate workload needed capacity")
 	}
 
-	if err := s.hasEnoughCapacity(&current, &needed); err != nil {
+	// we add extra overhead for some workload types here
+	if wl.Type == zos.KubernetesType {
+		// we add the min of 5% of allocated memory or 1G
+		needed.MRU += gridtypes.Min(needed.MRU*5/100, gridtypes.Gigabyte)
+	} // TODO: other types ?
+
+	if err := s.hasEnoughCapacity(&needed); err != nil {
 		return nil, errors.Wrap(err, "failed to satisfy required capacity")
 	}
 
