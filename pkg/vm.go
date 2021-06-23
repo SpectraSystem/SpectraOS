@@ -1,13 +1,23 @@
 package pkg
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 
+	"github.com/google/shlex"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
 )
 
 //go:generate zbusc -module vmd -version 0.0.1 -name manager -package stubs github.com/threefoldtech/zos/pkg+VMModule stubs/vmd_stub.go
+
+// Route structure
+type Route struct {
+	Net net.IPNet
+	// Gateway can be nil, in that
+	// case the device is used as a dev instead
+	Gateway net.IP
+}
 
 // VMIface structure
 type VMIface struct {
@@ -15,18 +25,14 @@ type VMIface struct {
 	Tap string
 	// Mac address of the device
 	MAC string
-	// Address of the device in the form of cidr for ipv4
-	IP4AddressCIDR net.IPNet
-	// Gateway address for ipv4
-	IP4GatewayIP net.IP
-	// Full subnet for the IP4 resource. This allows configuration of networking for
-	// non local subnets (i.e. NR on other nodes).
-	// Does not need to be set for public ifaces
-	IP4Net net.IPNet
-	// Address of the device in the form of cidr for ipv6
-	IP6AddressCIDR net.IPNet
-	// Gateway address for ipv6
-	IP6GatewayIP net.IP
+	// ips assigned to this interface
+	IPs []net.IPNet
+	// extra routes on this interface
+	Routes []Route
+	// IP4DefaultGateway address for ipv4
+	IP4DefaultGateway net.IP
+	// IP6DefaultGateway address for ipv6
+	IP6DefaultGateway net.IP
 	// Private or public network
 	Public bool
 }
@@ -41,10 +47,74 @@ type VMNetworkInfo struct {
 
 // VMDisk specifies vm disk params
 type VMDisk struct {
-	// Size is disk size in Mib
-	Path     string
-	ReadOnly bool
-	Root     bool
+	// Path raw disk path
+	Path string
+	// Target is mount point. Only in container mode
+	Target string
+}
+
+// BootType for vm
+type BootType uint8
+
+const (
+	// BootDisk booting from a virtual disk
+	BootDisk BootType = iota
+	// BootVirtioFS booting from a virtiofs mount
+	BootVirtioFS
+)
+
+// Boot structure
+type Boot struct {
+	Type BootType
+	Path string
+	//Environment only works with Boot type virtiofs
+	Environment map[string]string
+}
+
+// KernelArgs are arguments passed to the kernel
+type KernelArgs map[string]string
+
+// String builds commandline string
+func (s KernelArgs) String() string {
+	var buf bytes.Buffer
+	for k, v := range s {
+		if k == "init" {
+			//init must be handled later separately
+			continue
+		}
+		if buf.Len() > 0 {
+			buf.WriteRune(' ')
+		}
+		buf.WriteString(k)
+		if len(v) > 0 {
+			buf.WriteRune('=')
+			buf.WriteString(v)
+		}
+	}
+	init, ok := s["init"]
+	if ok {
+		if buf.Len() > 0 {
+			buf.WriteRune(' ')
+		}
+		parts, _ := shlex.Split(init)
+		if len(parts) > 0 {
+			buf.WriteString("init=")
+			buf.WriteString(parts[0])
+			for _, part := range parts[1:] {
+				buf.WriteRune(' ')
+				buf.WriteString(fmt.Sprintf("\"%s\"", part))
+			}
+		}
+	}
+
+	return buf.String()
+}
+
+// Extend the arguments with set of extra arguments
+func (s KernelArgs) Extend(k KernelArgs) {
+	for a, b := range k {
+		s[a] = b
+	}
 }
 
 // VM config structure
@@ -62,10 +132,15 @@ type VM struct {
 	// InitrdImage (optiona) path to initrd disk
 	InitrdImage string
 	// KernelArgs to override the default kernel arguments. (default: "ro console=ttyS0 noapic reboot=k panic=1 pci=off nomodules")
-	KernelArgs string
+	KernelArgs KernelArgs
 	// Disks are a list of disks that are going to
 	// be auto allocated on the provided storage path
 	Disks []VMDisk
+	// Boot options
+	Boot Boot
+	// Environment is injected to the VM via container mechanism (virtiofs)
+	// otherwise it's added to the kernel arguments
+	Environment map[string]string
 	// If this flag is set, the VM module will not auto start
 	// this machine hence, also no auto clean up when it exits
 	// it's up to the caller to check for the machine status
@@ -87,8 +162,8 @@ func (vm *VM) Validate() error {
 		return fmt.Errorf("kernel-image is required")
 	}
 
-	if vm.Memory < 512*gridtypes.Megabyte {
-		return fmt.Errorf("invalid memory must not be less than 512M")
+	if vm.Memory < 250*gridtypes.Megabyte {
+		return fmt.Errorf("invalid memory must not be less than 250M")
 	}
 
 	if vm.CPU == 0 || vm.CPU > 32 {

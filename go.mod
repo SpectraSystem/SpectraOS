@@ -23,6 +23,7 @@ require (
 	github.com/ethereum/go-ethereum v1.10.2 // indirect
 	github.com/fsnotify/fsnotify v1.4.9
 	github.com/g0rbe/go-chattr v0.0.0-20190906133247-aa435a6a0a37
+	github.com/garyburd/redigo v1.6.2
 	github.com/gizak/termui/v3 v3.1.0
 	github.com/go-ole/go-ole v1.2.5 // indirect
 	github.com/go-redis/redis v6.15.9+incompatible
@@ -32,7 +33,7 @@ require (
 	github.com/gomodule/redigo v2.0.0+incompatible
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/google/uuid v1.2.0
-	github.com/gorilla/handlers v1.5.1 // indirect
+	github.com/gorilla/handlers v1.5.1
 	github.com/gorilla/mux v1.8.0
 	github.com/hanwen/go-fuse/v2 v2.1.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.5-0.20210104140557-80c98217689d
