@@ -45,7 +45,7 @@ func NewFSStore(root string) (*Fs, error) {
 }
 
 func (s *Fs) deploymentPath(d *gridtypes.Deployment) string {
-	return filepath.Join(fmt.Sprint(d.TwinID), fmt.Sprint(d.DeploymentID))
+	return filepath.Join(fmt.Sprint(d.TwinID), fmt.Sprint(d.ContractID))
 }
 
 func (s *Fs) rooted(p ...string) string {
@@ -69,7 +69,7 @@ func (s *Fs) Add(d gridtypes.Deployment) error {
 	)
 
 	if os.IsExist(err) {
-		return errors.Wrapf(provision.ErrDeploymentExists, "object '%d' exist", d.DeploymentID)
+		return errors.Wrapf(provision.ErrDeploymentExists, "object '%d' exist", d.ContractID)
 	} else if err != nil {
 		return errors.Wrap(err, "failed to open workload file")
 	}
@@ -100,7 +100,7 @@ func (s *Fs) Set(dl gridtypes.Deployment) error {
 		0644,
 	)
 	if os.IsNotExist(err) {
-		return errors.Wrapf(provision.ErrDeploymentNotExists, "deployment '%d:%d' does not exist", dl.TwinID, dl.DeploymentID)
+		return errors.Wrapf(provision.ErrDeploymentNotExists, "deployment '%d:%d' does not exist", dl.TwinID, dl.ContractID)
 	} else if err != nil {
 		return errors.Wrap(err, "failed to open workload file")
 	}
@@ -147,20 +147,20 @@ func (s *Fs) get(path string) (gridtypes.Deployment, error) {
 }
 
 // Get gets a workload by id
-func (s *Fs) Get(twin, deployment uint32) (gridtypes.Deployment, error) {
+func (s *Fs) Get(twin uint32, deployment uint64) (gridtypes.Deployment, error) {
 	path := s.rooted(filepath.Join(fmt.Sprint(twin), fmt.Sprint(deployment)))
 
 	return s.get(path)
 }
 
 // ByTwin return list of deployment for given twin id
-func (s *Fs) ByTwin(twin uint32) ([]uint32, error) {
+func (s *Fs) ByTwin(twin uint32) ([]uint64, error) {
 	s.m.RLock()
 	defer s.m.RUnlock()
 	return s.byTwin(twin)
 }
 
-func (s *Fs) byTwin(twin uint32) ([]uint32, error) {
+func (s *Fs) byTwin(twin uint32) ([]uint64, error) {
 	base := filepath.Join(s.root, fmt.Sprint(twin))
 
 	entities, err := ioutil.ReadDir(base)
@@ -169,7 +169,7 @@ func (s *Fs) byTwin(twin uint32) ([]uint32, error) {
 	} else if err != nil {
 		return nil, errors.Wrap(err, "failed to list twin directory")
 	}
-	ids := make([]uint32, 0, len(entities))
+	ids := make([]uint64, 0, len(entities))
 	for _, entry := range entities {
 		if entry.IsDir() {
 			continue
@@ -181,7 +181,7 @@ func (s *Fs) byTwin(twin uint32) ([]uint32, error) {
 			continue
 		}
 
-		ids = append(ids, uint32(id))
+		ids = append(ids, uint64(id))
 	}
 
 	return ids, nil

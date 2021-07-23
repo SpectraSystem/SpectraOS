@@ -1,9 +1,10 @@
 package substrate
 
 import (
+	"crypto/ed25519"
 	"net"
 
-	"github.com/centrifuge/go-substrate-rpc-client/v2/types"
+	"github.com/centrifuge/go-substrate-rpc-client/v3/types"
 	"github.com/pkg/errors"
 )
 
@@ -27,17 +28,32 @@ func (t *Twin) IPAddress() net.IP {
 	return net.ParseIP(t.IP)
 }
 
-func (s *substrateClient) GetTwin(id uint32) (*Twin, error) {
-	meta, err := s.cl.RPC.State.GetMetadataLatest()
+// GetTwinByPubKey gets a twin with public key
+func (s *Substrate) GetTwinByPubKey(pk []byte) (uint32, error) {
+	key, err := types.CreateStorageKey(s.meta, "TfgridModule", "TwinIdByAccountID", pk, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get substrate meta")
+		return 0, errors.Wrap(err, "failed to create substrate query key")
+	}
+	var id types.U32
+	ok, err := s.cl.RPC.State.GetStorageLatest(key, &id)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to lookup entity")
 	}
 
+	if !ok || id == 0 {
+		return 0, errors.Wrap(ErrNotFound, "twin not found")
+	}
+
+	return uint32(id), nil
+}
+
+// GetTwin gets a twin
+func (s *Substrate) GetTwin(id uint32) (*Twin, error) {
 	bytes, err := types.EncodeToBytes(id)
 	if err != nil {
 		return nil, errors.Wrap(err, "substrate: encoding error building query arguments")
 	}
-	key, err := types.CreateStorageKey(meta, "TfgridModule", "Twins", bytes, nil)
+	key, err := types.CreateStorageKey(s.meta, "TfgridModule", "Twins", bytes, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create substrate query key")
 	}
@@ -68,4 +84,23 @@ func (s *substrateClient) GetTwin(id uint32) (*Twin, error) {
 	}
 
 	return &twin, nil
+}
+
+// CreateTwin creates a twin
+func (s *Substrate) CreateTwin(sk ed25519.PrivateKey, ip net.IP) (uint32, error) {
+	c, err := types.NewCall(s.meta, "TfgridModule.create_twin", ip.String())
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to create call")
+	}
+
+	if err := s.call(sk, c); err != nil {
+		return 0, errors.Wrap(err, "failed to create twin")
+	}
+
+	identity, err := Identity(sk)
+	if err != nil {
+		return 0, err
+	}
+
+	return s.GetTwinByPubKey(identity.PublicKey)
 }

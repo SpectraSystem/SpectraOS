@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"regexp"
 	"sort"
 
 	"github.com/pkg/errors"
@@ -13,15 +12,22 @@ import (
 
 // MachineInterface structure
 type MachineInterface struct {
+	// Network name (znet name) to join
 	Network gridtypes.Name `json:"network"`
-	IP      net.IP         `json:"ip"`
+	// IP of the zmachine on this network must be a valid Ip in the
+	// selected network
+	IP net.IP `json:"ip"`
 }
 
 // MachineNetwork structure
 type MachineNetwork struct {
-	PublicIP   gridtypes.Name     `json:"public_ip"`
+	// PublicIP optional public IP attached to this machine. If set
+	// it must be a valid name of a PublicIP workload in the same deployment
+	PublicIP gridtypes.Name `json:"public_ip"`
+	// Planetary support planetary network
+	Planetary bool `json:"planetary"`
+	// Interfaces list of user znets to join
 	Interfaces []MachineInterface `json:"interfaces"`
-	Planetary  bool               `json:"planetary"`
 }
 
 // Challenge builder
@@ -68,8 +74,12 @@ func (c *MachineCapacity) Challenge(w io.Writer) error {
 
 // MachineMount structure
 type MachineMount struct {
-	Name       gridtypes.Name `json:"name"`
-	Mountpoint string         `json:"mountpoint"`
+	// Name is name of a zmount. The name must be a valid zmount
+	// in the same deployment as the zmachine
+	Name gridtypes.Name `json:"name"`
+	// Mountpoint inside the container. Not used if the zmachine
+	// is running in a vm mode.
+	Mountpoint string `json:"mountpoint"`
 }
 
 // Challenge builder
@@ -87,24 +97,29 @@ func (m *MachineMount) Challenge(w io.Writer) error {
 
 // ZMachine reservation data
 type ZMachine struct {
-	Name            string          `json:"name"`
-	FList           string          `json:"flist"`
-	Network         MachineNetwork  `json:"network"`
-	Size            uint8           `json:"size"` // deprecated, use compute_capacity instead
+	// Flist of the zmachine, must be a valid url to an flist.
+	FList string `json:"flist"`
+	// Network configuration for machine network
+	Network MachineNetwork `json:"network"`
+	// Size of zmachine (deprecated)
+	Size uint8 `json:"size"` // deprecated, use compute_capacity instead
+	// ComputeCapacity configuration for machine cpu+memory
 	ComputeCapacity MachineCapacity `json:"compute_capacity"`
-	Mounts          []MachineMount  `json:"mounts"`
+	// Mounts configure mounts/disks attachments to this machine
+	Mounts []MachineMount `json:"mounts"`
+
 	// following items are only available in container mode. if FList is for a container
 	// not a VM.
-	Entrypoint string            `json:"entrypoint"`
-	Env        map[string]string `json:"env"`
+
+	// Entrypoint entrypoint of the container, if not set the configured one from the flist
+	// is going to be used
+	Entrypoint string `json:"entrypoint"`
+	// Env variables available for a container
+	Env map[string]string `json:"env"`
 }
 
 // Valid implementation
 func (v ZMachine) Valid(getter gridtypes.WorkloadGetter) error {
-	if matched, _ := regexp.MatchString("^[0-9a-zA-Z-.]*$", v.Name); !matched {
-		return fmt.Errorf("the name must consist of alphanumeric characters, dot, and dash ony")
-	}
-
 	if len(v.Network.Interfaces) != 1 {
 		return fmt.Errorf("only one network private network is supported at the moment")
 	}
@@ -136,6 +151,12 @@ func (v ZMachine) Valid(getter gridtypes.WorkloadGetter) error {
 		}
 	}
 
+	for _, ifc := range v.Network.Interfaces {
+		if ifc.Network == "ygg" { //reserved temporary
+			return fmt.Errorf("ygg is not a valid network name")
+		}
+	}
+
 	return nil
 }
 
@@ -158,10 +179,6 @@ func (v ZMachine) Capacity() (gridtypes.Capacity, error) {
 
 // Challenge creates signature challenge
 func (v ZMachine) Challenge(b io.Writer) error {
-	if _, err := fmt.Fprintf(b, "%s", v.Name); err != nil {
-		return err
-	}
-
 	if _, err := fmt.Fprintf(b, "%s", v.FList); err != nil {
 		return err
 	}

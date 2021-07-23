@@ -7,7 +7,10 @@ import (
 )
 
 var (
-	nameMatch = regexp.MustCompile("^[a-zA-Z0-9_]+$")
+	nameMatch     = regexp.MustCompile("^[a-zA-Z0-9_]+$")
+	reservedNames = map[Name]struct{}{
+		"ygg": {},
+	}
 )
 
 // DeploymentID is a global unique id for a deployment
@@ -45,7 +48,7 @@ func (i WorkloadID) String() string {
 }
 
 // Parts split id into building parts
-func (i WorkloadID) Parts() (twin, deployment uint32, name string, err error) {
+func (i WorkloadID) Parts() (twin uint32, deployment uint64, name string, err error) {
 	_, err = fmt.Sscanf(string(i), "%d-%d-%s", &twin, &deployment, &name)
 	return
 }
@@ -60,11 +63,14 @@ func IsValidName(n Name) error {
 		return fmt.Errorf("unsupported character in workload name")
 	}
 
+	if _, ok := reservedNames[n]; ok {
+		return fmt.Errorf("invalid name '%s' is reserved", n)
+	}
 	return nil
 }
 
 // NewWorkloadID creates a new global ID from it's parts
-func NewWorkloadID(twin uint32, deployment uint32, name Name) (WorkloadID, error) {
+func NewWorkloadID(twin uint32, deployment uint64, name Name) (WorkloadID, error) {
 	if err := IsValidName(name); err != nil {
 		return "", err
 	}

@@ -8,12 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/blang/semver"
 
 	"github.com/threefoldtech/zos/pkg/cache"
+	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/network/macvtap"
 	"github.com/threefoldtech/zos/pkg/network/ndmz"
 	"github.com/threefoldtech/zos/pkg/network/public"
@@ -21,6 +23,7 @@ import (
 	"github.com/threefoldtech/zos/pkg/network/wireguard"
 	"github.com/threefoldtech/zos/pkg/network/yggdrasil"
 	"github.com/threefoldtech/zos/pkg/stubs"
+	"github.com/threefoldtech/zos/pkg/substrate"
 
 	"github.com/vishvananda/netlink"
 
@@ -561,8 +564,17 @@ func (n networker) Addrs(iface string, netns string) ([]net.IP, error) {
 		if err != nil {
 			return errors.Wrapf(err, "failed to list addresses of interfaces %s", iface)
 		}
-		ips = make([]net.IP, len(addrs))
+		ips = make([]net.IP, 0, len(addrs))
 		for i, addr := range addrs {
+			ip := addr.IP
+			if ip6 := ip.To16(); ip6 != nil {
+				// ipv6
+				if !ip6.IsGlobalUnicast() || ifaceutil.IsULA(ip6) {
+					// skip if not global or is ula address
+					continue
+				}
+			}
+
 			ips[i] = addr.IP
 		}
 		return nil
@@ -722,19 +734,74 @@ func (n *networker) SetPublicConfig(cfg pkg.PublicConfig) error {
 	id := n.identity.NodeID(context.Background())
 	_, err := public.EnsurePublicSetup(id, &cfg)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to apply public config")
 	}
 
-	return public.SavePublicConfig(n.publicConfig, &cfg)
+	if err := public.SavePublicConfig(n.publicConfig, &cfg); err != nil {
+		return errors.Wrap(err, "failed to store public config")
+	}
+
+	// this is kinda dirty, but we need to update the node public config
+	// on the block-chain. so ...
+	env := environment.MustGet()
+	sub, err := env.GetSubstrate()
+	if err != nil {
+		return errors.Wrap(err, "failed to connect to substrate")
+	}
+	sk := n.identity.PrivateKey(context.Background())
+	identity, err := substrate.Identity(sk)
+	if err != nil {
+		return err
+	}
+	twin, err := sub.GetTwinByPubKey(identity.PublicKey)
+	if err != nil {
+		return errors.Wrap(err, "failed to get node twin by public key")
+	}
+
+	nodeID, err := sub.GetNodeByTwinID(twin)
+	if err != nil {
+		return errors.Wrap(err, "failed to get node by twin id")
+	}
+
+	node, err := sub.GetNode(nodeID)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get node with id: %d", nodeID)
+	}
+
+	cfg, err = public.GetPublicSetup()
+	if err != nil {
+		return errors.Wrap(err, "failed to get public setup")
+	}
+
+	subCfg := substrate.OptionPublicConfig{
+		HasValue: true,
+		AsValue: substrate.PublicConfig{
+			IPv4: cfg.IPv4.String(),
+			IPv6: cfg.IPv6.String(),
+			GWv4: cfg.GW4.String(),
+			GWv6: cfg.GW6.String(),
+		},
+	}
+
+	if reflect.DeepEqual(node.PublicConfig, subCfg) {
+		//nothing to do
+		return nil
+	}
+	// update the node
+	node.PublicConfig = subCfg
+	_, err = sub.UpdateNode(sk, *node)
+	return err
 }
 
 // Get node public namespace config
 func (n *networker) GetPublicConfig() (pkg.PublicConfig, error) {
-	cfg, err := public.LoadPublicConfig(n.publicConfig)
+	// TODO: instea of loading, this actually must get
+	// from reality.
+	cfg, err := public.GetPublicSetup()
 	if err != nil {
 		return pkg.PublicConfig{}, err
 	}
-	return *cfg, nil
+	return cfg, nil
 }
 
 func (n *networker) networkOf(id string) (nr pkg.Network, err error) {

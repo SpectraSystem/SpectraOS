@@ -2,6 +2,7 @@ package provisiond
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -105,7 +106,7 @@ func action(cli *cli.Context) error {
 	}
 
 	identity := stubs.NewIdentityManagerStub(cl)
-	nodeID := identity.NodeID(cli.Context)
+	sk := ed25519.PrivateKey(identity.PrivateKey(ctx))
 
 	// block until networkd is ready to serve request from zbus
 	// this is used to prevent uptime and online status to the explorer if the node is not in a fully ready
@@ -183,7 +184,6 @@ func action(cli *cli.Context) error {
 		cap,
 		current,
 		reserved,
-		nodeID.Identity(),
 		provisioners,
 	)
 
@@ -195,14 +195,33 @@ func action(cli *cli.Context) error {
 	// users := mw.NewUserMap()
 	// users.AddKeyFromHex(1, "95d1ba20e9f5cb6cfc6182fecfa904664fb1953eba520db454d5d5afaa82d791")
 
-	users, err := substrate.NewSubstrateTwins(env.SubstrateURL)
+	sub, err := env.GetSubstrate()
+	if err != nil {
+		return errors.Wrap(err, "failed to get connection to substrate")
+	}
+	users, err := provision.NewSubstrateTwins(sub)
 	if err != nil {
 		return errors.Wrap(err, "failed to create substrate users database")
 	}
 
-	admins, err := substrate.NewSubstrateAdmins(env.SubstrateURL, uint32(env.FarmerID))
+	admins, err := provision.NewSubstrateAdmins(sub, uint32(env.FarmerID))
 	if err != nil {
 		return errors.Wrap(err, "failed to create substrate admins database")
+	}
+
+	kp, err := substrate.Identity(sk)
+	if err != nil {
+		return errors.Wrap(err, "failed to get substrate keypair from secure key")
+	}
+
+	twin, err := sub.GetTwinByPubKey(kp.PublicKey)
+	if err != nil {
+		return errors.Wrap(err, "failed to get node twin id")
+	}
+
+	node, err := sub.GetNodeByTwinID(twin)
+	if err != nil {
+		return errors.Wrap(err, "failed to get node from twin")
 	}
 
 	queues := filepath.Join(rootDir, "queues")
@@ -216,6 +235,7 @@ func action(cli *cli.Context) error {
 		queues,
 		provision.WithTwins(users),
 		provision.WithAdmins(admins),
+		provision.WithSubstrate(node, sub),
 		// set priority to some reservation types on boot
 		// so we always need to make sure all volumes and networks
 		// comes first.
@@ -253,19 +273,17 @@ func action(cli *cli.Context) error {
 		log.Error().Err(err).Msg("failed to mark module as booted")
 	}
 
-	//TODO: uncomment me
-
-	// reporter, err := NewReported(store, identity, queues)
-	// if err != nil {
-	// 	return errors.Wrap(err, "failed to setup capacity reporter")
-	// }
-	// // also spawn the capacity reporter
-	// go func() {
-	// 	if err := reporter.Run(ctx); err != nil && err != context.Canceled {
-	// 		log.Fatal().Err(err).Msg("capacity reported stopped unexpectedely")
-	// 	}
-	// 	log.Info().Msg("capacity reported stopped")
-	// }()
+	reporter, err := NewReporter(engine, node, cl, queues)
+	if err != nil {
+		return errors.Wrap(err, "failed to setup capacity reporter")
+	}
+	// also spawn the capacity reporter
+	go func() {
+		if err := reporter.Run(ctx); err != nil && err != context.Canceled {
+			log.Fatal().Err(err).Msg("capacity reported stopped unexpectedely")
+		}
+		log.Info().Msg("capacity reported stopped")
+	}()
 
 	// and start the zbus server in the back ground
 	go func() {
