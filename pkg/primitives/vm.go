@@ -43,7 +43,7 @@ func (p *Primitives) virtualMachineProvision(ctx context.Context, wl *gridtypes.
 }
 
 func (p *Primitives) mountsToDisks(ctx context.Context, deployment gridtypes.Deployment, disks []zos.MachineMount, format bool) ([]pkg.VMDisk, error) {
-	storage := stubs.NewVDiskModuleStub(p.zbus)
+	storage := stubs.NewStorageModuleStub(p.zbus)
 
 	var results []pkg.VMDisk
 	for _, disk := range disks {
@@ -58,13 +58,13 @@ func (p *Primitives) mountsToDisks(ctx context.Context, deployment gridtypes.Dep
 			return nil, fmt.Errorf("invalid disk '%s' state", disk.Name)
 		}
 
-		info, err := storage.Inspect(ctx, wl.ID.String())
+		info, err := storage.DiskLookup(ctx, wl.ID.String())
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to inspect disk '%s'", disk.Name)
 		}
 
 		if format {
-			if err := storage.EnsureFilesystem(ctx, wl.ID.String()); err != nil {
+			if err := storage.DiskFormat(ctx, wl.ID.String()); err != nil {
 				return nil, errors.Wrap(err, "failed to prepare mount")
 			}
 		}
@@ -76,7 +76,7 @@ func (p *Primitives) mountsToDisks(ctx context.Context, deployment gridtypes.Dep
 }
 func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridtypes.WorkloadWithID) (result zos.ZMachineResult, err error) {
 	var (
-		storage = stubs.NewVDiskModuleStub(p.zbus)
+		storage = stubs.NewStorageModuleStub(p.zbus)
 		network = stubs.NewNetworkerStub(p.zbus)
 		flist   = stubs.NewFlisterStub(p.zbus)
 		vm      = stubs.NewVMModuleStub(p.zbus)
@@ -114,14 +114,16 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		Nameservers: []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1"), net.ParseIP("2001:4860:4860::8888")},
 	}
 
+	var ifs []string
+	var pubIf string
+
 	defer func() {
 		if err != nil {
-			for _, nic := range networkInfo.Ifaces {
-				if nic.Public {
-					network.DisconnectPubTap(ctx, nic.Tap)
-				} else {
-					network.RemoveTap(ctx, nic.Tap)
-				}
+			for _, nic := range ifs {
+				_ = network.RemoveTap(ctx, nic)
+			}
+			if pubIf != "" {
+				_ = network.DisconnectPubTap(ctx, pubIf)
 			}
 		}
 	}()
@@ -131,6 +133,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		if err != nil {
 			return result, err
 		}
+		ifs = append(ifs, tapNameFromName(wl.ID, string(nic.Network)))
 		networkInfo.Ifaces = append(networkInfo.Ifaces, inf)
 	}
 
@@ -139,6 +142,9 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		if err != nil {
 			return result, err
 		}
+
+		ipWl, _ := deployment.Get(config.Network.PublicIP)
+		pubIf = tapNameFromName(ipWl.ID, "pub")
 		networkInfo.Ifaces = append(networkInfo.Ifaces, inf)
 	}
 
@@ -149,6 +155,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		}
 
 		log.Debug().Msgf("Planetary: %+v", inf)
+		ifs = append(ifs, tapNameFromName(wl.ID, "ygg"))
 		networkInfo.Ifaces = append(networkInfo.Ifaces, inf)
 	}
 	// - mount flist RO
@@ -237,14 +244,14 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 			return result, fmt.Errorf("boot disk was not deployed correctly")
 		}
 		var info pkg.VDisk
-		info, err = storage.Inspect(ctx, disk.ID.String())
+		info, err = storage.DiskLookup(ctx, disk.ID.String())
 		if err != nil {
 			return result, errors.Wrap(err, "disk does not exist")
 		}
 
 		//TODO: this should not happen if disk image was written before !!
 		// fs detection must be done here
-		if err = storage.WriteImage(ctx, disk.ID.String(), imageInfo.ImagePath); err != nil {
+		if err = storage.DiskWrite(ctx, disk.ID.String(), imageInfo.ImagePath); err != nil {
 			return result, errors.Wrap(err, "failed to write image to disk")
 		}
 
@@ -265,7 +272,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 	err = p.vmRun(ctx, wl.ID.String(), &config, boot, disks, imageInfo, cmd, networkInfo)
 	if err != nil {
 		// attempt to delete the vm, should the process still be lingering
-		vm.Delete(ctx, wl.ID.String())
+		_ = vm.Delete(ctx, wl.ID.String())
 	}
 
 	return result, err
@@ -312,10 +319,10 @@ func (p *Primitives) vmDecomission(ctx context.Context, wl *gridtypes.WorkloadWi
 	if len(cfg.Network.PublicIP) > 0 {
 		deployment := provision.GetDeployment(ctx)
 		ipWl, err := deployment.Get(cfg.Network.PublicIP)
-		ifName := ipWl.ID.String()
 		if err != nil {
 			return err
 		}
+		ifName := tapNameFromName(ipWl.ID, "pub")
 		if err := network.RemovePubTap(ctx, ifName); err != nil {
 			return errors.Wrap(err, "could not clean up public tap device")
 		}

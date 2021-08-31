@@ -198,9 +198,17 @@ func GetDeployment(ctx context.Context) gridtypes.Deployment {
 	return *dl
 }
 
+func withDeployment(ctx context.Context, dl *gridtypes.Deployment) context.Context {
+	return context.WithValue(ctx, deploymentKey{}, dl)
+}
+
 // GetContract of deployment. panics if engine has no substrate set.
 func GetContract(ctx context.Context) *substrate.Contract {
 	return ctx.Value(contractKey{}).(*substrate.Contract)
+}
+
+func withContract(ctx context.Context, contract *substrate.Contract) context.Context {
+	return context.WithValue(ctx, contractKey{}, contract)
 }
 
 // GetSubstrate if engine has substrate set, panics otherwise
@@ -338,7 +346,7 @@ func (e *NativeEngine) Run(root context.Context) error {
 		}
 
 		job := obj.(*engineJob)
-		ctx := context.WithValue(root, deploymentKey{}, &job.Target)
+		ctx := withDeployment(root, &job.Target)
 
 		// contract validation
 		// this should ONLY be done on provosion and update operation
@@ -351,7 +359,7 @@ func (e *NativeEngine) Run(root context.Context) error {
 				if err := e.storage.Set(job.Target); err != nil {
 					log.Error().Err(err).Msg("failed to set deployment global error")
 				}
-				e.queue.Dequeue()
+				_, _ = e.queue.Dequeue()
 
 				continue
 			}
@@ -399,7 +407,10 @@ func (e *NativeEngine) Run(root context.Context) error {
 			}
 		}
 
-		e.queue.Dequeue()
+		_, err = e.queue.Dequeue()
+		if err != nil {
+			log.Error().Err(err).Msg("failed to dequeue job")
+		}
 	}
 }
 
@@ -417,7 +428,7 @@ func (e *NativeEngine) contract(ctx context.Context, dl *gridtypes.Deployment) (
 		return nil, errors.Wrap(err, "failed to get deployment contract")
 	}
 
-	ctx = context.WithValue(ctx, contractKey{}, contract)
+	ctx = withContract(ctx, contract)
 
 	if uint32(contract.Node) != e.nodeID {
 		return nil, fmt.Errorf("invalid node address in contract")
@@ -459,7 +470,7 @@ func (e *NativeEngine) boot(root context.Context) error {
 			// unfortunately we have to inject this value here
 			// since the boot runs outside the engine queue.
 
-			ctx := context.WithValue(root, deploymentKey{}, dl)
+			ctx := withDeployment(root, &dl)
 			if e.installDeployment(ctx, &dl) {
 				if err := e.storage.Set(dl); err != nil {
 					log.Error().Err(err).Msg("failed to set workload result")
@@ -660,7 +671,7 @@ func (e *NativeEngine) DecommissionCached(id string, reason string) error {
 
 	//to bad we have to repeat this here
 	ctx := context.WithValue(context.Background(), engineKey{}, e)
-	ctx = context.WithValue(ctx, deploymentKey{}, dl)
+	ctx = withDeployment(ctx, &dl)
 
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()

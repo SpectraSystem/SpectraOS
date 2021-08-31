@@ -51,7 +51,6 @@ const (
 	// ZDBYggIface is ygg interface name of the interface used in the 0-db network namespace
 	ZDBYggIface = "ygg0"
 
-	wgPortDir          = "wireguard_ports"
 	networkDir         = "networks"
 	ipamLeaseDir       = "ndmz-lease"
 	zdbNamespacePrefix = "zdb-ns-"
@@ -303,19 +302,19 @@ func (n *networker) PublicIPv4Support() bool {
 // SetupPubTap sets up a tap device in the host namespace for the public ip
 // reservation id. It is hooked to the public bridge. The name of the tap
 // interface is returned
-func (n *networker) SetupPubTap(pubIPReservationID string) (string, error) {
-	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Setting up public tap interface")
+func (n *networker) SetupPubTap(name string) (string, error) {
+	log.Info().Str("pubtap-name", string(name)).Msg("Setting up public tap interface")
 
 	if !n.ndmz.SupportsPubIPv4() {
 		return "", errors.New("can't create public tap on this node")
 	}
 
-	tapIface, err := pubTapName(pubIPReservationID)
+	tapIface, err := pubTapName(name)
 	if err != nil {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
 	}
 
-	hw := ifaceutil.HardwareAddrFromInputBytes([]byte(pubIPReservationID))
+	hw := ifaceutil.HardwareAddrFromInputBytes([]byte(name))
 	_, err = macvtap.CreateMACvTap(tapIface, public.PublicBridge, hw)
 
 	return tapIface, err
@@ -323,7 +322,7 @@ func (n *networker) SetupPubTap(pubIPReservationID string) (string, error) {
 
 // SetupYggTap sets up a tap device in the host namespace for the yggdrasil ip
 func (n *networker) SetupYggTap(name string) (tap pkg.YggdrasilTap, err error) {
-	log.Info().Str("pubip-res-id", string(name)).Msg("Setting up public tap interface")
+	log.Info().Str("pubtap-name", string(name)).Msg("Setting up public tap interface")
 
 	tapIface, err := tapName(name)
 	if err != nil {
@@ -359,10 +358,10 @@ func (n *networker) SetupYggTap(name string) (tap pkg.YggdrasilTap, err error) {
 }
 
 // PubTapExists checks if the tap device for the public network exists already
-func (n *networker) PubTapExists(pubIPReservationID string) (bool, error) {
-	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Checking if public tap interface exists")
+func (n *networker) PubTapExists(name string) (bool, error) {
+	log.Info().Str("pubtap-name", string(name)).Msg("Checking if public tap interface exists")
 
-	tapIface, err := pubTapName(pubIPReservationID)
+	tapIface, err := pubTapName(name)
 	if err != nil {
 		return false, errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -372,10 +371,10 @@ func (n *networker) PubTapExists(pubIPReservationID string) (bool, error) {
 
 // RemovePubTap removes the public tap device from the host namespace
 // of the networkID
-func (n *networker) RemovePubTap(pubIPReservationID string) error {
-	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Removing public tap interface")
+func (n *networker) RemovePubTap(name string) error {
+	log.Info().Str("pubtap-name", string(name)).Msg("Removing public tap interface")
 
-	tapIface, err := pubTapName(pubIPReservationID)
+	tapIface, err := pubTapName(name)
 	if err != nil {
 		return errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -459,10 +458,10 @@ nft 'delete chain arp filter handle '${a}`, filterName))
 
 // DisconnectPubTap disconnects the public tap from the network. The interface
 // itself is not removed and will need to be cleaned up later
-func (n *networker) DisconnectPubTap(pubIPReservationID string) error {
-	log.Info().Str("pubip-res-id", string(pubIPReservationID)).Msg("Disconnecting public tap interface")
+func (n *networker) DisconnectPubTap(name string) error {
+	log.Info().Str("pubtap-name", string(name)).Msg("Disconnecting public tap interface")
 
-	tapIfaceName, err := pubTapName(pubIPReservationID)
+	tapIfaceName, err := pubTapName(name)
 	if err != nil {
 		return errors.Wrap(err, "could not get network namespace tap device name")
 	}
@@ -565,7 +564,7 @@ func (n networker) Addrs(iface string, netns string) ([]net.IP, error) {
 			return errors.Wrapf(err, "failed to list addresses of interfaces %s", iface)
 		}
 		ips = make([]net.IP, 0, len(addrs))
-		for i, addr := range addrs {
+		for _, addr := range addrs {
 			ip := addr.IP
 			if ip6 := ip.To16(); ip6 != nil {
 				// ipv6
@@ -575,8 +574,9 @@ func (n networker) Addrs(iface string, netns string) ([]net.IP, error) {
 				}
 			}
 
-			ips[i] = addr.IP
+			ips = append(ips, addr.IP)
 		}
+
 		return nil
 	}
 
@@ -749,7 +749,7 @@ func (n *networker) SetPublicConfig(cfg pkg.PublicConfig) error {
 		return errors.Wrap(err, "failed to connect to substrate")
 	}
 	sk := n.identity.PrivateKey(context.Background())
-	identity, err := substrate.Identity(sk)
+	identity, err := substrate.IdentityFromSecureKey(sk)
 	if err != nil {
 		return err
 	}
@@ -789,7 +789,7 @@ func (n *networker) SetPublicConfig(cfg pkg.PublicConfig) error {
 	}
 	// update the node
 	node.PublicConfig = subCfg
-	_, err = sub.UpdateNode(sk, *node)
+	_, err = sub.UpdateNode(&identity, *node)
 	return err
 }
 
@@ -1035,7 +1035,7 @@ func createNetNS(name string) (ns.NetNS, error) {
 	})
 
 	if err != nil {
-		namespace.Delete(netNs)
+		_ = namespace.Delete(netNs)
 		return nil, fmt.Errorf("failed to bring lo interface up in namespace %s: %w", name, err)
 	}
 

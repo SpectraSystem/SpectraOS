@@ -1,7 +1,6 @@
 package substrate
 
 import (
-	"crypto/ed25519"
 	"fmt"
 
 	"github.com/centrifuge/go-substrate-rpc-client/v3/scale"
@@ -91,17 +90,38 @@ func (m OptionPublicConfig) Encode(encoder scale.Encoder) (err error) {
 	return
 }
 
+// Decode implementation
+func (m *OptionPublicConfig) Decode(decoder scale.Decoder) (err error) {
+	var i byte
+	if err := decoder.Decode(&i); err != nil {
+		return err
+	}
+
+	switch i {
+	case 0:
+		return nil
+	case 1:
+		m.HasValue = true
+		return decoder.Decode(&m.AsValue)
+	default:
+		return fmt.Errorf("unknown value for Option")
+	}
+}
+
 // Node type
 type Node struct {
 	Versioned
-	ID           types.U32
-	FarmID       types.U32
-	TwinID       types.U32
-	Resources    Resources
-	Location     Location
-	CountryID    types.U32
-	CityID       types.U32
-	PublicConfig OptionPublicConfig
+	ID            types.U32
+	FarmID        types.U32
+	TwinID        types.U32
+	Resources     Resources
+	Location      Location
+	Country       string
+	City          string
+	PublicConfig  OptionPublicConfig
+	Uptime        types.U64
+	Created       types.U64
+	FarmingPolicy types.U32
 }
 
 //GetNodeByTwinID gets a node by twin id
@@ -173,21 +193,21 @@ func (s *Substrate) getNode(key types.StorageKey) (*Node, error) {
 }
 
 // CreateNode creates a node
-func (s *Substrate) CreateNode(sk ed25519.PrivateKey, node Node) (uint32, error) {
+func (s *Substrate) CreateNode(identity *Identity, node Node) (uint32, error) {
 	if node.TwinID == 0 {
 		return 0, fmt.Errorf("twin id is required")
 	}
 
 	c, err := types.NewCall(s.meta, "TfgridModule.create_node",
 		node.FarmID, node.Resources, node.Location,
-		node.CountryID, node.CityID, node.PublicConfig,
+		node.Country, node.City, node.PublicConfig,
 	)
 
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to create call")
 	}
 
-	if err := s.call(sk, c); err != nil {
+	if _, err := s.call(identity, c); err != nil {
 		return 0, errors.Wrap(err, "failed to create node")
 	}
 
@@ -196,22 +216,37 @@ func (s *Substrate) CreateNode(sk ed25519.PrivateKey, node Node) (uint32, error)
 }
 
 // UpdateNode updates a node
-func (s *Substrate) UpdateNode(sk ed25519.PrivateKey, node Node) (uint32, error) {
+func (s *Substrate) UpdateNode(identity *Identity, node Node) (uint32, error) {
 	if node.TwinID == 0 {
 		return 0, fmt.Errorf("twin id is required")
 	}
 
 	c, err := types.NewCall(s.meta, "TfgridModule.update_node", node.ID, node.FarmID, node.Resources, node.Location,
-		node.CountryID, node.CityID, node.PublicConfig,
+		node.Country, node.City, node.PublicConfig,
 	)
 
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to create call")
 	}
 
-	if err := s.call(sk, c); err != nil {
+	if _, err := s.call(identity, c); err != nil {
 		return 0, errors.Wrap(err, "failed to update node")
 	}
 
 	return s.GetNodeByTwinID(uint32(node.TwinID))
+}
+
+// UpdateNodeUptime updates the node uptime to given value
+func (s *Substrate) UpdateNodeUptime(identity *Identity, uptime uint64) error {
+	c, err := types.NewCall(s.meta, "TfgridModule.report_uptime", uptime)
+
+	if err != nil {
+		return errors.Wrap(err, "failed to create call")
+	}
+
+	if _, err := s.call(identity, c); err != nil {
+		return errors.Wrap(err, "failed to update node uptime")
+	}
+
+	return nil
 }

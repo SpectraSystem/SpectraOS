@@ -1,7 +1,6 @@
 package substrate
 
 import (
-	"crypto/ed25519"
 	"fmt"
 
 	"github.com/centrifuge/go-substrate-rpc-client/v3/scale"
@@ -63,6 +62,70 @@ type Contract struct {
 	PublicIPs      []PublicIP
 }
 
+// CreateContract creates a contract for deployment
+func (s *Substrate) CreateContract(identity *Identity, node uint32, body []byte, hash string, publicIPs uint32) (uint64, error) {
+	c, err := types.NewCall(s.meta, "SmartContractModule.create_contract",
+		node, body, hash, publicIPs,
+	)
+
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to create call")
+	}
+
+	blockHash, err := s.call(identity, c)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to create contract")
+	}
+
+	if err := s.checkForError(blockHash, types.NewAccountID(identity.PublicKey)); err != nil {
+		return 0, err
+	}
+
+	return s.GetContractWithHash(node, hash)
+}
+
+// UpdateContract updates existing contract
+func (s *Substrate) UpdateContract(identity *Identity, contract uint64, body []byte, hash string) (uint64, error) {
+	c, err := types.NewCall(s.meta, "SmartContractModule.update_contract",
+		contract, body, hash,
+	)
+
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to create call")
+	}
+
+	blockHash, err := s.call(identity, c)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to update contract")
+	}
+
+	if err := s.checkForError(blockHash, types.NewAccountID(identity.PublicKey)); err != nil {
+		return 0, err
+	}
+
+	return contract, nil
+}
+
+// CancelContract creates a contract for deployment
+func (s *Substrate) CancelContract(identity *Identity, contract uint64) error {
+	c, err := types.NewCall(s.meta, "SmartContractModule.cancel_contract", contract)
+
+	if err != nil {
+		return errors.Wrap(err, "failed to cancel call")
+	}
+
+	blockHash, err := s.call(identity, c)
+	if err != nil {
+		return errors.Wrap(err, "failed to cancel contract")
+	}
+
+	if err := s.checkForError(blockHash, types.NewAccountID(identity.PublicKey)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // GetContract we should not have calls to create contract, instead only get
 func (s *Substrate) GetContract(id uint64) (*Contract, error) {
 	bytes, err := types.EncodeToBytes(id)
@@ -76,6 +139,33 @@ func (s *Substrate) GetContract(id uint64) (*Contract, error) {
 	}
 
 	return s.getContract(key)
+}
+
+// GetContractWithHash gets a contract given the node id and hash
+func (s *Substrate) GetContractWithHash(node uint32, hash string) (uint64, error) {
+	nodeBytes, err := types.EncodeToBytes(node)
+	if err != nil {
+		return 0, err
+	}
+	hashBytes, err := types.EncodeToBytes(hash)
+	if err != nil {
+		return 0, err
+	}
+	key, err := types.CreateStorageKey(s.meta, "SmartContractModule", "ContractIDByNodeIDAndHash", nodeBytes, hashBytes, nil)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to create substrate query key")
+	}
+	var contract types.U64
+	_, err = s.cl.RPC.State.GetStorageLatest(key, &contract)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to lookup contracts")
+	}
+
+	if contract == 0 {
+		return 0, errors.Wrap(ErrNotFound, "contract not found")
+	}
+
+	return uint64(contract), nil
 }
 
 // GetNodeContracts gets all contracts on a node (pk) in given state
@@ -148,13 +238,13 @@ func (s *Consumption) IsEmpty() bool {
 }
 
 // Report send a capacity report to substrate
-func (s *Substrate) Report(sk ed25519.PrivateKey, consumptions []Consumption) error {
+func (s *Substrate) Report(identity *Identity, consumptions []Consumption) error {
 	c, err := types.NewCall(s.meta, "SmartContractModule.add_reports", consumptions)
 	if err != nil {
 		return errors.Wrap(err, "failed to create call")
 	}
 
-	if err := s.call(sk, c); err != nil {
+	if _, err := s.call(identity, c); err != nil {
 		return errors.Wrap(err, "failed to create report")
 	}
 

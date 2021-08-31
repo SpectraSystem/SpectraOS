@@ -12,8 +12,8 @@ import (
 	"github.com/centrifuge/go-substrate-rpc-client/v3/types"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+	"github.com/shirou/gopsutil/host"
 	"github.com/threefoldtech/zbus"
-	"github.com/threefoldtech/zos/pkg/capacity"
 	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/geoip"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
@@ -22,22 +22,19 @@ import (
 	"github.com/threefoldtech/zos/pkg/substrate"
 )
 
-func registration(ctx context.Context, cl zbus.Client) (uint32, error) {
+const (
+	reportUptimeEvery = 8 * time.Hour
+)
+
+func registration(ctx context.Context, cl zbus.Client, cap gridtypes.Capacity) (nodeID, twinID uint32, err error) {
 	env, err := environment.Get()
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to get runtime environment for zos")
+		return 0, 0, errors.Wrap(err, "failed to get runtime environment for zos")
 	}
-
-	storage := stubs.NewStorageModuleStub(cl)
 
 	loc, err := geoip.Fetch()
 	if err != nil {
 		log.Fatal().Err(err).Msg("fetch location")
-	}
-	oracle := capacity.NewResourceOracle(storage)
-	cap, err := oracle.Total()
-	if err != nil {
-		return 0, errors.Wrap(err, "failed to get node capacity")
 	}
 
 	log.Debug().
@@ -49,23 +46,22 @@ func registration(ctx context.Context, cl zbus.Client) (uint32, error) {
 
 	sub, err := env.GetSubstrate()
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to create substrate client")
+		return 0, 0, errors.Wrap(err, "failed to create substrate client")
 	}
 
 	exp := backoff.NewExponentialBackOff()
 	exp.MaxInterval = 2 * time.Minute
 	bo := backoff.WithContext(exp, ctx)
-	var twinID uint32
 	err = backoff.RetryNotify(func() error {
-		twinID, err = registerNode(ctx, env, cl, sub, cap, loc)
+		nodeID, twinID, err = registerNode(ctx, env, cl, sub, cap, loc)
 		return err
 	}, bo, retryNotify)
 
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to register node")
+		return 0, 0, errors.Wrap(err, "failed to register node")
 	}
 
-	return twinID, nil
+	return nodeID, twinID, nil
 }
 
 func retryNotify(err error, d time.Duration) {
@@ -79,7 +75,7 @@ func registerNode(
 	sub *substrate.Substrate,
 	cap gridtypes.Capacity,
 	loc geoip.Location,
-) (uint32, error) {
+) (nodeID, twinID uint32, err error) {
 	var (
 		mgr    = stubs.NewIdentityManagerStub(cl)
 		netMgr = stubs.NewNetworkerStub(cl)
@@ -112,33 +108,36 @@ func registerNode(
 	log.Info().Msg("registering node on blockchain")
 
 	sk := ed25519.PrivateKey(mgr.PrivateKey(ctx))
-
-	if _, err := sub.EnsureAccount(sk); err != nil {
-		return 0, errors.Wrap(err, "failed to ensure account")
+	id, err := substrate.IdentityFromSecureKey(sk)
+	if err != nil {
+		return 0, 0, err
+	}
+	if _, err := sub.EnsureAccount(&id); err != nil {
+		return 0, 0, errors.Wrap(err, "failed to ensure account")
 	}
 
 	// make sure the node twin exists
 	cfg := yggdrasil.GenerateConfig(sk)
 	address, err := cfg.Address()
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to get yggdrasil address")
+		return 0, 0, errors.Wrap(err, "failed to get yggdrasil address")
 	}
 
-	twinID, err := ensureTwin(sub, sk, address)
+	twinID, err = ensureTwin(sub, sk, address)
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to ensure twin")
+		return 0, 0, errors.Wrap(err, "failed to ensure twin")
 	}
 
-	nodeID, err := sub.GetNodeByTwinID(twinID)
+	nodeID, err = sub.GetNodeByTwinID(twinID)
 	if err != nil && !errors.Is(err, substrate.ErrNotFound) {
-		return 0, err
+		return 0, 0, err
 	} else if err == nil {
 		// node exists. we validate everything is good
 		// otherwise we update the node
 		log.Debug().Uint32("node", nodeID).Msg("node already found on blockchain")
 		node, err := sub.GetNode(nodeID)
 		if err != nil {
-			return 0, errors.Wrapf(err, "failed to get node with id: %d", nodeID)
+			return 0, 0, errors.Wrapf(err, "failed to get node with id: %d", nodeID)
 		}
 
 		if reflect.DeepEqual(node.PublicConfig, pubCfg) &&
@@ -146,7 +145,7 @@ func registerNode(
 			reflect.DeepEqual(node.Location, location) {
 			// so node exists AND pub config, nor resources hasn't changed
 			log.Debug().Msg("node information has not changed")
-			return uint32(node.TwinID), nil
+			return uint32(node.ID), uint32(node.TwinID), nil
 		}
 
 		// we need to update the node
@@ -155,39 +154,89 @@ func registerNode(
 		node.Location = location
 
 		log.Debug().Msg("node data have changing, issuing an update node")
-		_, err = sub.UpdateNode(sk, *node)
-		return uint32(node.TwinID), err
+		_, err = sub.UpdateNode(&id, *node)
+		return uint32(node.ID), uint32(node.TwinID), err
 	}
 
 	// create node
-	_, err = sub.CreateNode(sk, substrate.Node{
+	nodeID, err = sub.CreateNode(&id, substrate.Node{
 		FarmID:       types.U32(env.FarmerID),
 		TwinID:       types.U32(twinID),
 		Resources:    resources,
 		Location:     location,
-		CountryID:    0,
-		CityID:       0,
+		Country:      loc.CountryCode,
+		City:         loc.City,
 		PublicConfig: pubCfg,
 	})
 
 	if err != nil {
-		return 0, err
+		return nodeID, 0, err
 	}
 
-	return twinID, nil
+	return nodeID, twinID, nil
 }
 
 func ensureTwin(sub *substrate.Substrate, sk ed25519.PrivateKey, ip net.IP) (uint32, error) {
-	identity, err := substrate.Identity(sk)
+	identity, err := substrate.IdentityFromSecureKey(sk)
 	if err != nil {
 		return 0, err
 	}
-	twin, err := sub.GetTwinByPubKey(identity.PublicKey)
+	twinID, err := sub.GetTwinByPubKey(identity.PublicKey)
 	if errors.Is(err, substrate.ErrNotFound) {
-		return sub.CreateTwin(sk, ip)
+		return sub.CreateTwin(&identity, ip)
 	} else if err != nil {
 		return 0, errors.Wrap(err, "failed to list twins")
 	}
 
-	return twin, nil
+	twin, err := sub.GetTwin(twinID)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to get twin object")
+	}
+
+	if twin.IP == ip.String() {
+		return twinID, nil
+	}
+
+	// update twin to new ip
+	return sub.UpdateTwin(&identity, ip)
+}
+
+func uptime(ctx context.Context, cl zbus.Client) error {
+	var (
+		mgr = stubs.NewIdentityManagerStub(cl)
+	)
+	env, err := environment.Get()
+	if err != nil {
+		return errors.Wrap(err, "failed to get runtime environment for zos")
+	}
+
+	sub, err := env.GetSubstrate()
+	if err != nil {
+		return errors.Wrap(err, "failed to create substrate client")
+	}
+
+	sk := ed25519.PrivateKey(mgr.PrivateKey(ctx))
+	id, err := substrate.IdentityFromSecureKey(sk)
+	if err != nil {
+		return err
+	}
+	first := make(chan struct{}, 1)
+	first <- struct{}{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-first:
+		case <-time.After(reportUptimeEvery):
+		}
+		uptime, err := host.Uptime()
+		if err != nil {
+			return errors.Wrap(err, "failed to get uptime")
+		}
+		log.Debug().Msg("updating node uptime")
+		if err := sub.UpdateNodeUptime(&id, uptime); err != nil {
+			log.Error().Err(err).Msg("failed to report uptime")
+		}
+	}
 }
