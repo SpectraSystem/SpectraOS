@@ -8,6 +8,7 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/threefoldtech/zos/pkg/capacity"
+	"github.com/threefoldtech/zos/pkg/environment"
 	"github.com/threefoldtech/zos/pkg/monitord"
 	"github.com/threefoldtech/zos/pkg/rmb"
 	"github.com/threefoldtech/zos/pkg/stubs"
@@ -53,6 +54,8 @@ func action(cli *cli.Context) error {
 		msgBrokerCon string = cli.String("broker")
 	)
 
+	env := environment.MustGet()
+
 	redis, err := zbus.NewRedisClient(msgBrokerCon)
 	if err != nil {
 		return errors.Wrap(err, "fail to connect to message broker server")
@@ -92,8 +95,17 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to get dmi information")
 	}
 
+	hypervisor, err := oracle.GetHypervisor()
+	if err != nil {
+		return errors.Wrap(err, "failed to get hypervisors")
+	}
+
 	bus.WithHandler("zos.system.dmi", func(ctx context.Context, payload []byte) (interface{}, error) {
 		return dmi, nil
+	})
+
+	bus.WithHandler("zos.system.hypervisor", func(ctx context.Context, payload []byte) (interface{}, error) {
+		return hypervisor, nil
 	})
 
 	// answer calls for dmi
@@ -107,6 +119,8 @@ func action(cli *cli.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "failed during node registration")
 	}
+
+	// TODO: monitor change to yggdrasil Ip and update the twin according
 
 	log.Info().Uint32("node", node).Uint32("twin", twin).Msg("node registered")
 
@@ -123,5 +137,5 @@ func action(cli *cli.Context) error {
 	log.Info().Uint32("twin", twin).Msg("node has been registered")
 	log.Debug().Msg("start message bus")
 
-	return runMsgBus(ctx, twin)
+	return runMsgBus(ctx, twin, env.SubstrateURL)
 }
