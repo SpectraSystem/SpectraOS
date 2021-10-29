@@ -38,6 +38,12 @@ func (s *StorageMock) VolumeCreate(ctx context.Context, name string, size gridty
 	}, args.Error(1)
 }
 
+// UpdateFilesystem update filesystem mock
+func (s *StorageMock) VolumeUpdate(ctx context.Context, name string, size gridtypes.Unit) error {
+	args := s.Called(ctx, name)
+	return args.Error(0)
+}
+
 // ReleaseFilesystem releases filesystem mock
 func (s *StorageMock) VolumeDelete(ctx context.Context, name string) error {
 	args := s.Called(ctx, name)
@@ -62,8 +68,8 @@ func (t *testCommander) args(args ...string) (map[string]string, []string) {
 	v := make(map[string]string)
 	var r []string
 	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			lk = strings.TrimPrefix(arg, "-")
+		if strings.HasPrefix(arg, "--") {
+			lk = strings.TrimPrefix(arg, "--")
 			v[lk] = ""
 			continue
 		}
@@ -119,7 +125,7 @@ func (t *testSystem) Unmount(target string, flags int) error {
 func TestCommander(t *testing.T) {
 	cmder := testCommander{T: t}
 
-	m, r := cmder.args("-log", "log-file", "remaining")
+	m, r := cmder.args("--log", "log-file", "remaining")
 
 	require.Equal(t, []string{"remaining"}, r)
 	require.Equal(t, map[string]string{

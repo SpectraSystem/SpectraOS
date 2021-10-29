@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 
 	"github.com/jbenet/go-base58"
 	"github.com/pkg/errors"
@@ -42,38 +43,61 @@ func (p *Primitives) virtualMachineProvision(ctx context.Context, wl *gridtypes.
 	return p.virtualMachineProvisionImpl(ctx, wl)
 }
 
-func (p *Primitives) mountsToDisks(ctx context.Context, deployment gridtypes.Deployment, disks []zos.MachineMount, format bool) ([]pkg.VMDisk, error) {
-	storage := stubs.NewStorageModuleStub(p.zbus)
-
-	var results []pkg.VMDisk
-	for _, disk := range disks {
-		wl, err := deployment.Get(disk.Name)
+func (p *Primitives) vmMounts(ctx context.Context, deployment gridtypes.Deployment, mounts []zos.MachineMount, format bool, vm *pkg.VM) error {
+	for _, mount := range mounts {
+		wl, err := deployment.Get(mount.Name)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to get disk '%s' workload", disk.Name)
-		}
-		if wl.Type != zos.ZMountType {
-			return nil, fmt.Errorf("expecting a reservation of type '%s' for disk '%s'", zos.ZMountType, disk.Name)
+			return errors.Wrapf(err, "failed to get mount '%s' workload", mount.Name)
 		}
 		if wl.Result.State != gridtypes.StateOk {
-			return nil, fmt.Errorf("invalid disk '%s' state", disk.Name)
+			return fmt.Errorf("invalid disk '%s' state", mount.Name)
 		}
-
-		info, err := storage.DiskLookup(ctx, wl.ID.String())
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to inspect disk '%s'", disk.Name)
-		}
-
-		if format {
-			if err := storage.DiskFormat(ctx, wl.ID.String()); err != nil {
-				return nil, errors.Wrap(err, "failed to prepare mount")
+		switch wl.Type {
+		case zos.ZMountType:
+			if err := p.mountDisk(ctx, wl, mount, format, vm); err != nil {
+				return err
 			}
+		case zos.QuantumSafeFSType:
+			if err := p.mountQsfs(wl, mount, vm); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("expecting a reservation of type '%s' or '%s' for disk '%s'", zos.ZMountType, zos.QuantumSafeFSType, mount.Name)
 		}
+	}
+	return nil
+}
 
-		results = append(results, pkg.VMDisk{Path: info.Path, Target: disk.Mountpoint})
+func (p *Primitives) mountDisk(ctx context.Context, wl *gridtypes.WorkloadWithID, mount zos.MachineMount, format bool, vm *pkg.VM) error {
+	storage := stubs.NewStorageModuleStub(p.zbus)
+
+	info, err := storage.DiskLookup(ctx, wl.ID.String())
+	if err != nil {
+		return errors.Wrapf(err, "failed to inspect disk '%s'", mount.Name)
 	}
 
-	return results, nil
+	if format {
+		if err := storage.DiskFormat(ctx, wl.ID.String()); err != nil {
+			return errors.Wrap(err, "failed to prepare mount")
+		}
+	}
+
+	vm.Disks = append(vm.Disks, pkg.VMDisk{Path: info.Path, Target: mount.Mountpoint})
+
+	return nil
 }
+
+func (p *Primitives) mountQsfs(wl *gridtypes.WorkloadWithID, mount zos.MachineMount, vm *pkg.VM) error {
+
+	var info zos.QuatumSafeFSResult
+	if err := wl.Result.Unmarshal(&info); err != nil {
+		return fmt.Errorf("invalid qsfs result '%s': %w", mount.Name, err)
+	}
+	wlID := wl.ID.String()
+	vm.Shared = append(vm.Shared, pkg.SharedDir{ID: strings.ReplaceAll(wlID, "-", ""), Path: info.Path, Target: mount.Mountpoint})
+	return nil
+}
+
 func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridtypes.WorkloadWithID) (result zos.ZMachineResult, err error) {
 	var (
 		storage = stubs.NewStorageModuleStub(p.zbus)
@@ -83,13 +107,18 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 
 		config ZMachine
 	)
-
 	if vm.Exists(ctx, wl.ID.String()) {
 		return result, provision.ErrDidNotChange
 	}
 
 	if err := json.Unmarshal(wl.Data, &config); err != nil {
 		return result, errors.Wrap(err, "failed to decode reservation schema")
+	}
+	machine := pkg.VM{
+		Name:        wl.ID.String(),
+		CPU:         config.ComputeCapacity.CPU,
+		Memory:      config.ComputeCapacity.Memory,
+		Environment: config.Env,
 	}
 	// Should config.Vaid() be called here?
 
@@ -175,7 +204,6 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 	log.Debug().Msgf("detected flist type: %+v", imageInfo)
 
 	var boot pkg.Boot
-	var disks []pkg.VMDisk
 
 	// "root=/dev/vda rw console=ttyS0 reboot=k panic=1"
 	cmd := pkg.KernelArgs{
@@ -192,14 +220,29 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		if err := flist.Unmount(ctx, wl.ID.String()); err != nil {
 			return result, errors.Wrapf(err, "failed to unmount flist: %s", wl.ID.String())
 		}
+		rootfsSize := config.Size
+		if rootfsSize < 250*gridtypes.Megabyte {
+			rootfsSize = 250 * gridtypes.Megabyte
+		}
 		// remounting in RW mode
-		mnt, err = flist.Mount(ctx, wl.ID.String(), config.FList, pkg.DefaultMountOptions)
+		mnt, err = flist.Mount(ctx, wl.ID.String(), config.FList, pkg.MountOptions{
+			ReadOnly: false,
+			Limit:    rootfsSize,
+		})
 		if err != nil {
 			return result, errors.Wrapf(err, "failed to mount flist: %s", wl.ID.String())
 		}
 
+		hash, err := flist.FlistHash(ctx, cloudContainerFlist)
+		if err != nil {
+			return zos.ZMachineResult{}, errors.Wrap(err, "failed to get cloud-container flist hash")
+		}
+
+		// if the name changes (because flist changed, a new mount will be created)
+		name := fmt.Sprintf("%s:%s", cloudContainerName, hash)
+
 		// now mount cloud image also
-		cloudImage, err := flist.Mount(ctx, cloudContainerName, cloudContainerFlist, pkg.ReadOnlyMountOptions)
+		cloudImage, err := flist.Mount(ctx, name, cloudContainerFlist, pkg.ReadOnlyMountOptions)
 		if err != nil {
 			return result, errors.Wrap(err, "failed to mount cloud container base image")
 		}
@@ -219,9 +262,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		cmd["host"] = string(wl.Name)
 		// change the root boot to use the right virtiofs tag
 		cmd["init"] = config.Entrypoint
-
-		disks, err = p.mountsToDisks(ctx, deployment, config.Mounts, true)
-		if err != nil {
+		if err := p.vmMounts(ctx, deployment, config.Mounts, true, &machine); err != nil {
 			return result, err
 		}
 	} else {
@@ -260,18 +301,20 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 			Type: pkg.BootDisk,
 			Path: info.Path,
 		}
-		// we don't format disks attached to VMs, it's up to the vm to decide that
-		disks, err = p.mountsToDisks(ctx, deployment, config.Mounts[1:], false)
-		if err != nil {
+		if err := p.vmMounts(ctx, deployment, config.Mounts[1:], false, &machine); err != nil {
 			return result, err
 		}
 	}
 
 	// - Attach mounts
 	// - boot
+	machine.Network = networkInfo
+	machine.KernelImage = imageInfo.Kernel
+	machine.InitrdImage = imageInfo.Initrd
+	machine.KernelArgs = cmd
+	machine.Boot = boot
 
-	err = p.vmRun(ctx, wl.ID.String(), &config, boot, disks, imageInfo, cmd, networkInfo)
-	if err != nil {
+	if err := vm.Run(ctx, machine); err != nil {
 		// attempt to delete the vm, should the process still be lingering
 		_ = vm.Delete(ctx, wl.ID.String())
 	}
@@ -330,36 +373,6 @@ func (p *Primitives) vmDecomission(ctx context.Context, wl *gridtypes.WorkloadWi
 	}
 
 	return nil
-}
-
-func (p *Primitives) vmRun(
-	ctx context.Context,
-	name string,
-	config *ZMachine,
-	boot pkg.Boot,
-	disks []pkg.VMDisk,
-	imageInfo FListInfo,
-	cmdline pkg.KernelArgs,
-	networkInfo pkg.VMNetworkInfo) error {
-
-	vm := stubs.NewVMModuleStub(p.zbus)
-
-	cap := config.ComputeCapacity
-	// installed disk
-	kubevm := pkg.VM{
-		Name:        name,
-		CPU:         cap.CPU,
-		Memory:      cap.Memory,
-		Network:     networkInfo,
-		KernelImage: imageInfo.Kernel,
-		InitrdImage: imageInfo.Initrd,
-		KernelArgs:  cmdline,
-		Boot:        boot,
-		Environment: config.Env,
-		Disks:       disks,
-	}
-
-	return vm.Run(ctx, kubevm)
 }
 
 func tapNameFromName(id gridtypes.WorkloadID, network string) string {

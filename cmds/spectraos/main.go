@@ -6,12 +6,13 @@ import (
 	"path/filepath"
 
 	"github.com/rs/zerolog/log"
-	"github.com/threefoldtech/zos/cmds/modules/capacityd"
 	"github.com/threefoldtech/zos/cmds/modules/contd"
 	"github.com/threefoldtech/zos/cmds/modules/flistd"
 	"github.com/threefoldtech/zos/cmds/modules/gateway"
 	"github.com/threefoldtech/zos/cmds/modules/networkd"
+	"github.com/threefoldtech/zos/cmds/modules/noded"
 	"github.com/threefoldtech/zos/cmds/modules/provisiond"
+	"github.com/threefoldtech/zos/cmds/modules/qsfsd"
 	"github.com/threefoldtech/zos/cmds/modules/storaged"
 	"github.com/threefoldtech/zos/cmds/modules/vmd"
 	"github.com/threefoldtech/zos/cmds/modules/zbusdebug"
@@ -40,11 +41,12 @@ func main() {
 			&flistd.Module,
 			&contd.Module,
 			&vmd.Module,
-			&capacityd.Module,
+			&noded.Module,
 			&networkd.Module,
 			&provisiond.Module,
 			&zbusdebug.Module,
 			&gateway.Module,
+			&qsfsd.Module,
 		},
 		Action: func(c *cli.Context) error {
 			if !c.Bool("list") {

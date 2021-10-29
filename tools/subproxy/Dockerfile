@@ -1,1 +1,9 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/a5cecb13c31248f8508beb1f9b39ab11
+FROM golang:alpine3.14 as BUILDER
+WORKDIR /opt/zos
+COPY . .
+WORKDIR /opt/zos/tools/subproxy/
+RUN go build
+
+FROM alpine:3.13.5
+COPY --from=BUILDER /opt/zos/tools/subproxy/subproxy /bin/
+ENTRYPOINT [ "/bin/subproxy" ]

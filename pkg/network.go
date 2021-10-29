@@ -3,7 +3,9 @@ package pkg
 import (
 	"context"
 	"net"
+	"reflect"
 
+	"github.com/threefoldtech/substrate-client"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
 	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 )
@@ -68,6 +70,21 @@ type Networker interface {
 	// for zdb is rewind. ns param is the namespace return by the ZDBPrepare
 	ZDBDestroy(ns string) error
 
+	// QSFSNamespace returns the namespace of the qsfs workload
+	QSFSNamespace(id string) string
+
+	// QSFSYggIP returns the ygg ip of the qsfs workload
+	QSFSYggIP(id string) (string, error)
+
+	// QSFSPrepare creates a network namespace with a macvlan interface into it
+	// to allow qsfs container to reach the internet but not be reachable itself
+	// it return the name of the network namespace created, and the ygg ip.
+	// the id should be unique.
+	QSFSPrepare(id string) (string, string, error)
+
+	// QSFSDestroy rewind setup by QSFSPrepare
+	QSFSDestroy(id string) error
+
 	// SetupPrivTap sets up a tap device in the network namespace for the networkID. It is hooked
 	// to the network bridge. The name of the tap interface is returned
 	SetupPrivTap(networkID NetID, name string) (string, error)
@@ -126,7 +143,7 @@ type Networker interface {
 
 	// Addrs return the IP addresses of interface
 	// if the interface is in a network namespace netns needs to be not empty
-	Addrs(iface string, netns string) ([]net.IP, error)
+	Addrs(iface string, netns string) (ips []net.IP, mac string, err error)
 
 	WireguardPorts() ([]uint, error)
 
@@ -189,6 +206,27 @@ type PublicConfig struct {
 	// Domain is the node domain name like gent01.devnet.grid.tf
 	// or similar
 	Domain string `json:"domain"`
+}
+
+func PublicConfigFrom(cfg substrate.PublicConfig) (pub PublicConfig, err error) {
+	pub.Type = MacVlanIface
+	pub.IPv4, err = gridtypes.ParseIPNet(cfg.IPv4)
+	if err != nil {
+		return pub, err
+	}
+	pub.IPv6, err = gridtypes.ParseIPNet(cfg.IPv6)
+	if err != nil {
+		return pub, err
+	}
+	pub.GW4 = net.ParseIP(cfg.GWv4)
+	pub.GW6 = net.ParseIP(cfg.GWv6)
+	pub.Domain = cfg.Domain
+
+	return
+}
+
+func (p PublicConfig) Equal(cfg PublicConfig) bool {
+	return reflect.DeepEqual(p, cfg)
 }
 
 type OptionPublicConfig struct {
