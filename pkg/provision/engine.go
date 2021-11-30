@@ -2,7 +2,6 @@ package provision
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -22,13 +21,6 @@ import (
 // EngineOption interface
 type EngineOption interface {
 	apply(e *NativeEngine)
-}
-
-// WithJanitor sets a janitor for the engine.
-// a janitor is executed periodically to clean up
-// the deployed resources.
-func WithJanitor(j Janitor) EngineOption {
-	return &withJanitorOpt{j}
 }
 
 // WithTwins sets the user key getter on the
@@ -106,15 +98,6 @@ type NativeEngine struct {
 var _ Engine = (*NativeEngine)(nil)
 var _ pkg.Provision = (*NativeEngine)(nil)
 
-type withJanitorOpt struct {
-	j Janitor
-}
-
-func (o *withJanitorOpt) apply(e *NativeEngine) {
-	panic("not imple=nted")
-	// e.janitor = o.j
-}
-
 type withUserKeyGetter struct {
 	g Twins
 }
@@ -178,7 +161,7 @@ func (w *withRerunAll) apply(e *NativeEngine) {
 
 type nullKeyGetter struct{}
 
-func (n *nullKeyGetter) GetKey(id uint32) (ed25519.PublicKey, error) {
+func (n *nullKeyGetter) GetKey(id uint32) ([]byte, error) {
 	return nil, fmt.Errorf("null user key getter")
 }
 
@@ -609,7 +592,7 @@ func (e *NativeEngine) updateWorkload(ctx context.Context, wl *gridtypes.Workloa
 	return true
 }
 
-func (e *NativeEngine) uninstallDeployment(ctx context.Context, getter gridtypes.WorkloadByTypeGetter, reason string) {
+func (e *NativeEngine) uninstallDeployment(ctx context.Context, getter gridtypes.WorkloadGetter, reason string) {
 	for i := len(e.order) - 1; i >= 0; i-- {
 		typ := e.order[i]
 
@@ -620,7 +603,7 @@ func (e *NativeEngine) uninstallDeployment(ctx context.Context, getter gridtypes
 	}
 }
 
-func (e *NativeEngine) installDeployment(ctx context.Context, getter gridtypes.WorkloadByTypeGetter) (changed bool) {
+func (e *NativeEngine) installDeployment(ctx context.Context, getter gridtypes.WorkloadGetter) (changed bool) {
 	for _, typ := range e.order {
 		workloads := getter.ByType(typ)
 
@@ -663,23 +646,6 @@ func (e *NativeEngine) updateDeployment(ctx context.Context, ops []gridtypes.Upg
 		}
 	}
 	return
-}
-
-// Counters implements the zbus interface
-func (e *NativeEngine) Counters(ctx context.Context) <-chan pkg.ProvisionCounters {
-	//TODO: implement counters
-	// this is probably need to be moved to
-	ch := make(chan pkg.ProvisionCounters)
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(5 * time.Minute):
-			ch <- pkg.ProvisionCounters{}
-		}
-	}()
-
-	return ch
 }
 
 // DecommissionCached implements the zbus interface

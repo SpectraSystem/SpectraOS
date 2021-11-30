@@ -13,12 +13,12 @@ import (
 
 const (
 	// SubstrateDevURL default substrate url
-	SubstrateDevURL  = "wss://tfchain.dev.threefold.io"
-	ActivationDevURL = "https://tfchain.dev.threefold.io/activation/activate"
+	SubstrateDevURL  = "wss://tfchain.dev.grid.tf/"
+	ActivationDevURL = "https://activation.dev.grid.tf/activation/activate"
 
 	// SubstrateDevURL default substrate url
-	SubstrateTestURL  = "wss://tfchain.test.threefold.io"
-	ActivationTestURL = "https://tfchain.test.threefold.io/activation/activate"
+	SubstrateTestURL  = "wss://tfchain.test.grid.tf/"
+	ActivationTestURL = "https://activation.test.grid.tf/activation/activate"
 )
 
 // Environment holds information about running environment of a node
@@ -142,6 +142,12 @@ func getEnvironmentFromParams(params kernel.Params) (Environment, error) {
 	if substrate, ok := params.Get("substrate"); ok {
 		if len(substrate) > 0 {
 			env.SubstrateURL = substrate[len(substrate)-1]
+		}
+	}
+
+	if activation, ok := params.Get("activation"); ok {
+		if len(activation) > 0 {
+			env.ActivationURL = activation[len(activation)-1]
 		}
 	}
 

@@ -1,10 +1,12 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net"
 	"os"
 	"os/exec"
@@ -15,13 +17,13 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/threefoldtech/zos/pkg/cache"
-	"github.com/threefoldtech/zos/pkg/network/macvtap"
 	"github.com/threefoldtech/zos/pkg/network/ndmz"
 	"github.com/threefoldtech/zos/pkg/network/public"
 	"github.com/threefoldtech/zos/pkg/network/tuntap"
 	"github.com/threefoldtech/zos/pkg/network/wireguard"
 	"github.com/threefoldtech/zos/pkg/network/yggdrasil"
 	"github.com/threefoldtech/zos/pkg/stubs"
+	"github.com/threefoldtech/zos/pkg/zinit"
 
 	"github.com/vishvananda/netlink"
 
@@ -337,8 +339,7 @@ func (n *networker) SetupPubTap(name string) (string, error) {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
 	}
 
-	hw := ifaceutil.HardwareAddrFromInputBytes([]byte(name))
-	_, err = macvtap.CreateMACvTap(tapIface, public.PublicBridge, hw)
+	_, err = tuntap.CreateTap(tapIface, public.PublicBridge)
 
 	return tapIface, err
 }
@@ -402,32 +403,112 @@ func (n *networker) RemovePubTap(name string) error {
 	return ifaceutil.Delete(tapIface, nil)
 }
 
+var (
+	pubIpTemplateSetup = template.Must(template.New("filter-setup").Parse(
+		`# add vm
+# add a chain for the vm public interface in arp and bridge
+nft 'add chain bridge filter {{.Name}}-pre'
+nft 'add chain bridge filter {{.Name}}-post'
+
+# make nft jump to vm chain
+nft 'add rule bridge filter prerouting iifname "{{.Iface}}" jump {{.Name}}-pre'
+nft 'add rule bridge filter postrouting oifname "{{.Iface}}" jump {{.Name}}-post'
+
+nft 'add rule bridge filter {{.Name}}-pre ip saddr . ether saddr != { {{.IPv4}} . {{.Mac}} } counter drop'
+nft 'add rule bridge filter {{.Name}}-pre ip6 saddr . ether saddr != { {{.IPv6}} . {{.Mac}} } counter drop'
+
+nft 'add rule bridge filter {{.Name}}-pre arp operation reply arp saddr ip != {{.IPv4}} counter drop'
+nft 'add rule bridge filter {{.Name}}-pre arp operation request arp saddr ip != {{.IPv4}} counter drop'
+
+nft 'add rule bridge filter {{.Name}}-post ip daddr . ether daddr != { {{.IPv4}} . {{.Mac}} } counter drop'
+nft 'add rule bridge filter {{.Name}}-post ip6 saddr . ether saddr != { {{.IPv6}} . {{.Mac}} } counter drop'
+`))
+
+	pubIpTemplateDestroy = template.Must(template.New("filter-destroy").Parse(
+		`# in bridge table
+nft 'flush chain bridge filter {{.Name}}-post'
+nft 'flush chain bridge filter {{.Name}}-pre'
+
+# the .name rule is for backward compatibility
+# to make sure older chains are deleted
+nft 'flush chain bridge filter {{.Name}}' || true
+
+# we need to make sure this clean up can also work on older setup
+# jump to chain rule
+a=$( nft -a list table bridge filter | awk '/jump {{.Name}}-pre/{ print $NF}' )
+if [ -n "${a}" ]; then
+	nft delete rule bridge filter prerouting handle ${a}
+fi
+a=$( nft -a list table bridge filter | awk '/jump {{.Name}}-post/{ print $NF}' )
+if [ -n "${a}" ]; then
+	nft delete rule bridge filter postrouting handle ${a}
+fi
+a=$( nft -a list table bridge filter | awk '/jump {{.Name}}/{ print $NF}' )
+if [ -n "${a}" ]; then
+	nft delete rule bridge filter forward handle ${a}
+fi
+
+# chain itself
+for chain in $( nft -a list table bridge filter | awk '/chain {{.Name}}/{ print $NF}' ); do
+	nft delete chain bridge filter handle ${chain}
+done
+
+# the next section is only for backward compatibility
+# in arp table
+nft 'flush chain arp filter {{.Name}}'
+# jump to chain rule
+a=$( nft -a list table arp filter | awk '/jump {{.Name}}/{ print $NF}' )
+if [ -n "${a}" ]; then
+	nft delete rule arp filter input handle ${a}
+fi
+# chain itself
+a=$( nft -a list table arp filter | awk '/chain {{.Name}}/{ print $NF}' )
+if [ -n "${a}" ]; then
+	nft delete chain arp filter handle ${a}
+fi
+`))
+)
+
 // SetupPubIPFilter sets up filter for this public ip
-func (n *networker) SetupPubIPFilter(filterName string, iface string, ip string, ipv6 string, mac string) error {
+func (n *networker) SetupPubIPFilter(filterName string, iface string, ipv4 net.IP, ipv6 net.IP, mac string) error {
 	if n.PubIPFilterExists(filterName) {
 		return nil
 	}
 
+	ipv4 = ipv4.To4()
+	ipv6 = ipv6.To16()
+	// if no ipv4 or ipv6 provided, we make sure
+	// to use zero ip so the user can't just assign
+	// an ip to his vm to use.
+	if len(ipv4) == 0 {
+		ipv4 = net.IPv4zero
+	}
+
+	if len(ipv6) == 0 {
+		ipv6 = net.IPv6zero
+	}
+
+	data := struct {
+		Name  string
+		Iface string
+		Mac   string
+		IPv4  string
+		IPv6  string
+	}{
+		Name:  filterName,
+		Iface: iface,
+		Mac:   mac,
+		IPv4:  ipv4.String(),
+		IPv6:  ipv6.String(),
+	}
+
+	var buffer bytes.Buffer
+	if err := pubIpTemplateSetup.Execute(&buffer, data); err != nil {
+		return errors.Wrap(err, "failed to execute filter template")
+	}
+
 	//TODO: use nft.Apply
-	cmd := exec.Command("/bin/sh", "-c",
-		fmt.Sprintf(`# add vm
-# add a chain for the vm public interface in arp and bridge
-nft 'add chain arp filter %[1]s'
-nft 'add chain bridge filter %[1]s'
-
-# make nft jump to vm chain
-nft 'add rule arp filter input iifname "%[2]s" jump %[1]s'
-nft 'add rule bridge filter forward iifname "%[2]s" jump %[1]s'
-
-# arp rule for vm
-nft 'add rule arp filter %[1]s arp operation reply arp saddr ip . arp saddr ether != { %[3]s . %[4]s } drop'
-
-# filter on L2 fowarding of non-matching ip/mac, drop RA,dhcpv6,dhcp
-nft 'add rule bridge filter %[1]s ip saddr . ether saddr != { %[3]s . %[4]s } counter drop'
-nft 'add rule bridge filter %[1]s ip6 saddr . ether saddr != { %[5]s . %[4]s } counter drop'
-nft 'add rule bridge filter %[1]s icmpv6 type nd-router-advert drop'
-nft 'add rule bridge filter %[1]s ip6 version 6 udp sport 547 drop'
-nft 'add rule bridge filter %[1]s ip version 4 udp sport 67 drop'`, filterName, iface, ip, mac, ipv6))
+	cmd := exec.Command("/bin/sh", "-c", buffer.String())
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -450,24 +531,18 @@ func (n *networker) PubIPFilterExists(filterName string) bool {
 
 // RemovePubIPFilter removes the filter setted up by SetupPubIPFilter
 func (n *networker) RemovePubIPFilter(filterName string) error {
-	cmd := exec.Command("/bin/sh", "-c",
-		fmt.Sprintf(`# in bridge table
-nft 'flush chain bridge filter %[1]s'
-# jump to chain rule
-a=$( nft -a list table bridge filter | awk '/jump %[1]s/{ print $NF}' )
-nft 'delete rule bridge filter forward handle '${a}
-# chain itself
-a=$( nft -a list table bridge filter | awk '/chain %[1]s/{ print $NF}' )
-nft 'delete chain bridge filter handle '${a}
+	data := struct {
+		Name string
+	}{
+		Name: filterName,
+	}
 
-# in arp table
-nft 'flush chain arp filter %[1]s'
-# jump to chain rule
-a=$( nft -a list table arp filter | awk '/jump %[1]s/{ print $NF}' )
-nft 'delete rule arp filter input handle '${a}
-# chain itself
-a=$( nft -a list table arp filter | awk '/chain %[1]s/{ print $NF}' )
-nft 'delete chain arp filter handle '${a}`, filterName))
+	var buffer bytes.Buffer
+	if err := pubIpTemplateDestroy.Execute(&buffer, data); err != nil {
+		return errors.Wrap(err, "failed to execute filter template")
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", buffer.String())
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -480,12 +555,10 @@ nft 'delete chain arp filter handle '${a}`, filterName))
 // itself is not removed and will need to be cleaned up later
 func (n *networker) DisconnectPubTap(name string) error {
 	log.Info().Str("pubtap-name", string(name)).Msg("Disconnecting public tap interface")
-
 	tapIfaceName, err := pubTapName(name)
 	if err != nil {
 		return errors.Wrap(err, "could not get network namespace tap device name")
 	}
-
 	tap, err := netlink.LinkByName(tapIfaceName)
 	if _, ok := err.(netlink.LinkNotFoundError); ok {
 		return nil
@@ -496,9 +569,7 @@ func (n *networker) DisconnectPubTap(name string) error {
 		return errors.Wrap(err, "could not load tap device")
 	}
 
-	//setting the txqueue on a macvtap will prevent traffic from
-	//going over the device, effectively disconnecting it.
-	return netlink.LinkSetTxQLen(tap, 0)
+	return netlink.LinkSetNoMaster(tap)
 }
 
 // GetPublicIPv6Subnet returns the IPv6 prefix op the public subnet of the host
@@ -796,6 +867,13 @@ func (n *networker) SetPublicConfig(cfg pkg.PublicConfig) error {
 	if err != nil {
 		return err
 	}
+
+	// since the public ip might have changed, it seems sometimes ygg needs to be
+	// restart to use new public ip
+	if err := ygg.Restart(zinit.Default()); err != nil {
+		log.Error().Err(err).Msg("failed to restart yggdrasil service")
+	}
+
 	// if yggdrasil is living inside public namespace
 	// we still need to setup ndmz to also have yggdrasil but we set the yggdrasil interface
 	// a different Ip that lives inside the yggdrasil range.

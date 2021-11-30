@@ -498,7 +498,7 @@ func (s *Module) ensureCache() error {
 		log.Warn().Msg("failed to create persisted cache disk. Running on limited cache")
 
 		// set limited cache flag
-		if err := app.SetFlag("limited-cache"); err != nil {
+		if err := app.SetFlag(app.LimitedCache); err != nil {
 			return err
 		}
 
@@ -734,12 +734,11 @@ func (s *Module) Monitor(ctx context.Context) <-chan pkg.PoolsStats {
 }
 
 func (s *Module) periodicallyCheckDiskShutdown(vm bool) {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Hour)
 
 	go func() {
 		for {
 			<-ticker.C
-			log.Info().Msg("Checking pools for disks that should be shutdown...")
 			s.shutdownDisks(vm)
 		}
 	}()
