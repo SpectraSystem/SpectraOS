@@ -16,9 +16,9 @@ import (
 	"github.com/shirou/gopsutil/disk"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/app"
-	"github.com/threefoldtech/zos/pkg/capacity"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
 	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
+	"github.com/threefoldtech/zos/pkg/kernel"
 	"github.com/threefoldtech/zos/pkg/storage/filesystem"
 )
 
@@ -140,11 +140,8 @@ func (s *Module) initialize() error {
 	defer s.mu.Unlock()
 	log.Info().Msgf("Initializing storage module")
 
-	//vm := true
-	hyperVisor, err := capacity.NewResourceOracle(nil).GetHypervisor()
-	vm := err == nil && len(hyperVisor) > 0
-
-	log.Debug().Bool("is-vm", vm).Msg("virtualization detection")
+	vm := kernel.GetParams().IsVirtualMachine()
+	log.Debug().Bool("is-vm", vm).Msg("debugging virtualization detection")
 
 	// Make sure we finish in 1 minute
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*1)
@@ -298,6 +295,15 @@ func (s *Module) VolumeCreate(name string, size gridtypes.Unit) (pkg.Volume, err
 	if strings.HasPrefix(name, "zdb") {
 		return pkg.Volume{}, fmt.Errorf("invalid volume name. zdb prefix is reserved")
 	}
+
+	volume, err := s.VolumeLookup(name)
+	if err == nil {
+		return volume, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return pkg.Volume{}, err
+	}
+
+	// otherwise, create a new volume
 
 	fs, err := s.createSubvolWithQuota(size, name)
 	if err != nil {
@@ -461,7 +467,9 @@ func (s *Module) ensureCache() error {
 
 	// check if cache volume available
 	for _, pool := range s.ssds {
+		log.Debug().Str("pool", pool.Name()).Msg("checking pool for cache volume")
 		if _, err := pool.Mounted(); err != nil {
+			log.Debug().Str("pool", pool.Name()).Msg("pool is not mounted")
 			continue
 		}
 
@@ -469,6 +477,7 @@ func (s *Module) ensureCache() error {
 		if err != nil {
 			return err
 		}
+
 		for _, fs := range filesystems {
 			if fs.Name() == cacheLabel {
 				log.Debug().Msgf("Found existing cache at %v", fs.Path())

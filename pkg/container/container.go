@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"os/exec"
+	"strconv"
 
 	"github.com/BurntSushi/toml"
 	"github.com/pkg/errors"
@@ -37,8 +38,9 @@ import (
 )
 
 const (
-	containerdSock = "/run/containerd/containerd.sock"
-	binaryLogsShim = "/bin/shim-logs"
+	containerdSock         = "/run/containerd/containerd.sock"
+	binaryLogsShim         = "/bin/shim-logs"
+	defaultShutdownTimeout = 3 * time.Second
 )
 
 const (
@@ -92,16 +94,15 @@ func New(client zbus.Client, root string, containerd string) *Module {
 		failures: cache.New(time.Minute, 20*time.Second),
 	}
 
-	if err := module.upgrade(); err != nil {
+	if err := module.startup(); err != nil {
 		log.Error().Err(err).Msg("failed to update containers configurations")
 	}
 
 	return module
 }
 
-// upgrade containers configurations. we make sure that any configuration changes apply
-// to the running containers..
-func (c *Module) upgrade() error {
+// startup makes sure container have correct config, and also make sure they are running
+func (c *Module) startup() error {
 	// We make sure that ALL containers have auto-restart disabled since this is now
 	// managed completely by the watcher.
 	client, err := containerd.New(c.containerd)
@@ -129,6 +130,10 @@ func (c *Module) upgrade() error {
 			if err := container.Update(ctx, restart.WithNoRestarts); err != nil { // mark this container as perminant down. so the watcher
 				log.Warn().Err(err).Msg("failed to clear up restart task status, continuing anyways") // does not try to restart it again
 			}
+
+			if err := c.ensureTask(ctx, container); err != nil {
+				log.Error().Err(err).Str("ns", ns).Str("id", container.ID()).Msg("failed to ensure container is running")
+			}
 		}
 	}
 
@@ -137,7 +142,7 @@ func (c *Module) upgrade() error {
 
 // Run creates and starts a container
 func (c *Module) Run(ns string, data pkg.Container) (id pkg.ContainerID, err error) {
-	log.Info().Str("ns", ns).Msg("starting container")
+	log.Debug().Str("ns", ns).Msg("starting container")
 
 	// create a new client connected to the default socket path for containerd
 	client, err := containerd.New(c.containerd)
@@ -167,6 +172,10 @@ func (c *Module) Run(ns string, data pkg.Container) (id pkg.ContainerID, err err
 		data.Logs = []logger.Logs{}
 	}
 
+	if data.ShutdownTimeout == 0 {
+		data.ShutdownTimeout = defaultShutdownTimeout
+	}
+
 	// we never allow any container to boot without a network namespace
 	if data.Network.Namespace == "" {
 		return "", fmt.Errorf("cannot create container without network namespace")
@@ -181,6 +190,9 @@ func (c *Module) Run(ns string, data pkg.Container) (id pkg.ContainerID, err err
 		oci.WithRootFSPath(data.RootFS),
 		oci.WithEnv(data.Env),
 		oci.WithHostResolvconf,
+		oci.WithAnnotations(map[string]string{
+			"shutdown_timeout": fmt.Sprintf("%d", data.ShutdownTimeout),
+		}),
 		removeRunMount(),
 		withNetworkNamespace(data.Network.Namespace),
 		withMounts(data.Mounts),
@@ -215,7 +227,7 @@ func (c *Module) Run(ns string, data pkg.Container) (id pkg.ContainerID, err err
 		opts = append(opts, oci.WithProcessArgs(args...))
 	}
 
-	log.Info().
+	log.Debug().
 		Str("namespace", ns).
 		Str("data", fmt.Sprintf("%+v", data)).
 		Msgf("create new container")
@@ -237,13 +249,13 @@ func (c *Module) Run(ns string, data pkg.Container) (id pkg.ContainerID, err err
 	if err != nil {
 		return id, err
 	}
-	log.Info().Msgf("args %+v", spec.Process.Args)
-	log.Info().Msgf("env %+v", spec.Process.Env)
-	log.Info().Msgf("root %+v", spec.Root)
+	log.Debug().Msgf("args %+v", spec.Process.Args)
+	log.Debug().Msgf("env %+v", spec.Process.Env)
+	log.Debug().Msgf("root %+v", spec.Root)
 	for _, linxNS := range spec.Linux.Namespaces {
-		log.Info().Msgf("namespace %+v", linxNS.Type)
+		log.Debug().Msgf("namespace %+v", linxNS.Type)
 	}
-	log.Info().Msgf("mounts %+v", spec.Mounts)
+	log.Debug().Msgf("mounts %+v", spec.Mounts)
 
 	defer func() {
 		// if any of the next steps below fails, make sure
@@ -262,7 +274,7 @@ func (c *Module) Run(ns string, data pkg.Container) (id pkg.ContainerID, err err
 
 	// creating and serializing logs settings for external logger
 	confpath := path.Join(cfgs, fmt.Sprintf("%s-logs.json", container.ID()))
-	log.Info().Str("cfg", confpath).Msg("writing logs settings")
+	log.Debug().Str("cfg", confpath).Msg("writing logs settings")
 
 	err = logger.Serialize(confpath, data.Logs)
 	if err != nil {
@@ -379,23 +391,27 @@ func (c *Module) ensureTask(ctx context.Context, container containerd.Container)
 		return err
 	}
 
-	log.Info().Str("loguri", uri.String()).Msg("external logging process")
+	log.Debug().Str("loguri", uri.String()).Msg("external logging process")
 	task, err := container.Task(ctx, nil)
 
 	if err != nil && !errdefs.IsNotFound(err) {
-		return err
+		return errors.Wrap(err, "failed to list container tasks")
 	} else if err == nil {
-		//task found, we have to stop that first
-		_, err := task.Delete(ctx)
-		if err != nil {
-			return err
+		// we found a task
+		status, _ := task.Status(ctx)
+		if status.Status == containerd.Running {
+			return nil
 		}
+
+		if _, err := task.Delete(ctx); err != nil {
+			return errors.Wrap(err, "failed to delete the container task")
+		}
+
 	}
 
-	//and finally create a new task
 	task, err = container.NewTask(ctx, cio.LogURI(uri))
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to create container task")
 	}
 
 	return task.Start(ctx)
@@ -420,7 +436,7 @@ func (c *Module) start(ns, id string) error {
 
 // Inspect returns the detail about a running container
 func (c *Module) Inspect(ns string, id pkg.ContainerID) (result pkg.Container, err error) {
-	log.Info().Str("id", string(id)).Str("ns", ns).Msg("inspect container")
+	log.Debug().Str("id", string(id)).Str("ns", ns).Msg("inspect container")
 
 	client, err := containerd.New(c.containerd)
 	if err != nil {
@@ -480,7 +496,7 @@ func (c *Module) Inspect(ns string, id pkg.ContainerID) (result pkg.Container, e
 
 // ListNS list the name of all the container namespaces
 func (c *Module) ListNS() ([]string, error) {
-	log.Info().Msg("list namespaces")
+	log.Debug().Msg("list namespaces")
 
 	client, err := containerd.New(c.containerd)
 	if err != nil {
@@ -494,7 +510,7 @@ func (c *Module) ListNS() ([]string, error) {
 
 // List all the existing container IDs from a certain namespace ns
 func (c *Module) List(ns string) ([]pkg.ContainerID, error) {
-	log.Info().Str("ns", ns).Msg("list containers")
+	log.Debug().Str("ns", ns).Msg("list containers")
 
 	client, err := containerd.New(c.containerd)
 	if err != nil {
@@ -519,9 +535,8 @@ func (c *Module) List(ns string) ([]pkg.ContainerID, error) {
 	return ids, nil
 }
 
-// Delete stops and remove a container
-func (c *Module) Delete(ns string, id pkg.ContainerID) error {
-	log.Info().Str("id", string(id)).Str("ns", ns).Msg("delete container")
+func (c *Module) SignalDelete(ns string, id pkg.ContainerID) error {
+	log.Debug().Str("id", string(id)).Str("ns", ns).Msg("delete container")
 
 	client, err := containerd.New(c.containerd)
 	if err != nil {
@@ -537,7 +552,51 @@ func (c *Module) Delete(ns string, id pkg.ContainerID) error {
 	if err != nil {
 		return err
 	}
+	// mark this container as perminant down. so the watcher
+	// does not try to restart it again
+	c.failures.Set(string(id), permanent, cache.DefaultExpiration)
 
+	task, err := container.Task(ctx, nil)
+	if err == nil {
+		// err == nil, there is a task running inside the container
+		log.Debug().Str("id", string(id)).Int("signal", int(syscall.SIGTERM)).Msg("sending signal")
+		_ = task.Kill(ctx, syscall.SIGTERM)
+	}
+	return nil
+}
+
+// Delete stops and remove a container
+func (c *Module) Delete(ns string, id pkg.ContainerID) error {
+	log.Debug().Str("id", string(id)).Str("ns", ns).Msg("delete container")
+
+	client, err := containerd.New(c.containerd)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	// log.Debug().Msg("fetching namespace")
+	ctx := namespaces.WithNamespace(context.Background(), ns)
+
+	// log.Debug().Str("id", string(id)).Msg("fetching container")
+	container, err := client.LoadContainer(ctx, string(id))
+	if err != nil {
+		return err
+	}
+	spec, err := container.Spec(ctx)
+	if err != nil {
+		return errors.Wrap(err, "couldn't load container spec")
+	}
+	shutdownTimeout := defaultShutdownTimeout
+	shutdownTimeoutStr, ok := spec.Annotations["shutdown_timeout"]
+	if ok {
+		shutdownTimeoutUint64, err := strconv.ParseUint(shutdownTimeoutStr, 10, 64)
+		if err != nil {
+			log.Error().Err(err).Str("shutdown_timeout", shutdownTimeoutStr).Err(err).Msg("couldn't parse shutdown timeout")
+		} else {
+			shutdownTimeout = time.Duration(shutdownTimeoutUint64)
+		}
+	}
 	// mark this container as perminant down. so the watcher
 	// does not try to restart it again
 	c.failures.Set(string(id), permanent, cache.DefaultExpiration)
@@ -549,28 +608,17 @@ func (c *Module) Delete(ns string, id pkg.ContainerID) error {
 		if err != nil {
 			return err
 		}
-		trials := 3
-	loop:
-		for {
-			signal := syscall.SIGTERM
-			if trials <= 0 {
-				signal = syscall.SIGKILL
-			}
-
-			log.Debug().Str("id", string(id)).Int("signal", int(signal)).Msg("sending signal")
-			_ = task.Kill(ctx, signal)
-			trials--
-
+		log.Debug().Str("id", string(id)).Int("signal", int(syscall.SIGTERM)).Msg("sending signal")
+		_ = task.Kill(ctx, syscall.SIGTERM)
+		select {
+		case <-exitC:
+		case <-time.After(time.Duration(shutdownTimeout)):
+			log.Debug().Str("id", string(id)).Int("signal", int(syscall.SIGKILL)).Msg("sending signal")
+			_ = task.Kill(ctx, syscall.SIGKILL)
 			select {
 			case <-exitC:
-				break loop
-			case <-time.After(1 * time.Second):
-			}
-
-			if trials < -5 {
-				msg := fmt.Errorf("cannot stop container, SIGTERM and SIGKILL ignored")
-				log.Error().Err(msg).Msg("stopping container failed")
-				break loop
+			case <-time.After(time.Second):
+				log.Warn().Str("id", string(id)).Msg("didn't receive container exit signal after SIGKILLing")
 			}
 		}
 
@@ -607,7 +655,7 @@ func applyStartup(data *pkg.Container, path string) error {
 	}
 	defer f.Close()
 
-	log.Info().Msg("startup file found")
+	log.Debug().Msg("startup file found")
 
 	startup := startup{}
 	if _, err := toml.DecodeReader(f, &startup); err != nil {

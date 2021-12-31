@@ -15,18 +15,19 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zos/pkg"
+	"github.com/threefoldtech/zos/pkg/gridtypes"
 	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 	"github.com/threefoldtech/zos/pkg/stubs"
 )
 
 const (
-	qsfsFlist             = "https://hub.grid.tf/azmy.3bot/qsfs.flist"
+	qsfsFlist             = "https://hub.grid.tf/omar0.3bot/qsfs-v0.0.1.flist"
 	qsfsContainerNS       = "qsfs"
 	qsfsRootFsPropagation = pkg.RootFSPropagationSlave
 	zstorSocket           = "/var/run/zstor.sock"
 	zstorZDBFSMountPoint  = "/mnt" // hardcoded in the container
 	zstorMetricsPort      = 9100
-	zstorZDBDataDirPath   = "/data"
+	zstorZDBDataDirPath   = "/data/data/zdbfs-data"
 )
 
 type QSFS struct {
@@ -41,7 +42,6 @@ type zstorConfig struct {
 	Socket          string `toml:"socket"`
 	MetricsPort     uint32 `toml:"prometheus_port"`
 	ZDBFSMountpoint string `toml:"zdbfs_mountpoint"`
-	Root            string `toml:"root"`
 }
 
 func New(ctx context.Context, cl zbus.Client, root string) (pkg.QSFSD, error) {
@@ -52,10 +52,12 @@ func New(ctx context.Context, cl zbus.Client, root string) (pkg.QSFSD, error) {
 		return nil, errors.Wrap(err, "couldn't make qsfs mounts dir")
 	}
 
-	return &QSFS{
+	qsfs := &QSFS{
 		cl:         cl,
 		mountsPath: mountPath,
-	}, nil
+	}
+	go qsfs.periodicCleanup(ctx)
+	return qsfs, nil
 }
 
 func setQSFSDefaults(cfg *zos.QuantumSafeFS) zstorConfig {
@@ -65,16 +67,13 @@ func setQSFSDefaults(cfg *zos.QuantumSafeFS) zstorConfig {
 		MetricsPort:         zstorMetricsPort,
 		ZDBFSMountpoint:     zstorZDBFSMountPoint,
 		ZDBDataDirPath:      zstorZDBDataDirPath,
-		Root:                zstorZDBFSMountPoint,
 	}
 }
 
 func (q *QSFS) Mount(wlID string, cfg zos.QuantumSafeFS) (info pkg.QSFSInfo, err error) {
 	defer func() {
 		if err != nil {
-			if err := q.Unmount(wlID); err != nil {
-				log.Error().Err(err).Msg("error cleaning up after qsfs setup failure")
-			}
+			q.Unmount(wlID)
 		}
 	}()
 	zstorConfig := setQSFSDefaults(&cfg)
@@ -82,8 +81,12 @@ func (q *QSFS) Mount(wlID string, cfg zos.QuantumSafeFS) (info pkg.QSFSInfo, err
 	flistd := stubs.NewFlisterStub(q.cl)
 	contd := stubs.NewContainerModuleStub(q.cl)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
+	marked, _ := q.isMarkedForDeletion(ctx, wlID)
+	if marked {
+		return info, errors.New("qsfs marked for deletion, try again later")
+	}
 	netns, yggIP, err := networkd.QSFSPrepare(ctx, wlID)
 	if err != nil {
 		return info, errors.Wrap(err, "failed to prepare qsfs")
@@ -109,9 +112,10 @@ func (q *QSFS) Mount(wlID string, cfg zos.QuantumSafeFS) (info pkg.QSFSInfo, err
 	cont := pkg.Container{
 		Name:        wlID,
 		RootFS:      flistPath,
-		Entrypoint:  "/sbin/zinit init",
+		Entrypoint:  "/sbin/zinit init --container",
 		Interactive: false,
 		Network:     pkg.NetworkInfo{Namespace: netns},
+		Memory:      gridtypes.Gigabyte,
 		Mounts: []pkg.MountInfo{
 			{
 				Source: mountPath,
@@ -195,6 +199,13 @@ func (q *QSFS) UpdateMount(wlID string, cfg zos.QuantumSafeFS) (pkg.QSFSInfo, er
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 	defer cancel()
 
+	marked, err := q.isMarkedForDeletion(ctx, wlID)
+	if marked {
+		return info, errors.New("already marked for deletion")
+	}
+	if err != nil {
+		return info, errors.Wrap(err, "failed to check deletion mark")
+	}
 	yggIP, err := networkd.QSFSYggIP(ctx, wlID)
 	if err != nil {
 		return info, errors.Wrap(err, "failed to get ygg ip")
@@ -216,34 +227,24 @@ func (q *QSFS) UpdateMount(wlID string, cfg zos.QuantumSafeFS) (pkg.QSFSInfo, er
 	return info, nil
 }
 
-func (q *QSFS) Unmount(wlID string) error {
-	networkd := stubs.NewNetworkerStub(q.cl)
-	flistd := stubs.NewFlisterStub(q.cl)
+func (q *QSFS) SignalDelete(wlID string) error {
 	contd := stubs.NewContainerModuleStub(q.cl)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// listing all containers and matching the name looks like a lot of work
-	if err := contd.Delete(ctx, qsfsContainerNS, pkg.ContainerID(wlID)); err != nil {
-		log.Error().Err(err).Msg("failed to delete qsfs container")
-	}
-	mountPath := q.mountPath(wlID)
-	// unmount twice, once for the zdbfs and the self-mount
-	if err := syscall.Unmount(mountPath, 0); err != nil {
-		log.Error().Err(err).Msg("failed to unmount mount path 1st time")
-	}
-	if err := syscall.Unmount(mountPath, 0); err != nil {
-		log.Error().Err(err).Msg("failed to unmount mount path 2nd time")
-	}
-	if err := os.RemoveAll(mountPath); err != nil {
-		log.Error().Err(err).Msg("failed to remove mountpath dir")
-	}
-	if err := flistd.Unmount(ctx, wlID); err != nil {
-		log.Error().Err(err).Msg("failed to unmount flist")
-	}
+	marked, err := q.isMarkedForDeletion(ctx, wlID)
 
-	if err := networkd.QSFSDestroy(ctx, wlID); err != nil {
-		log.Error().Err(err).Msg("failed to destrpy qsfs network")
+	if marked {
+		return errors.New("already marked for deletion")
+	}
+	if err != nil {
+		return errors.Wrap(err, "failed to check deletion mark")
+	}
+	if err := q.markDelete(ctx, wlID); err != nil {
+		// container dead, no need to continue
+		return err
+	}
+	if err := contd.SignalDelete(ctx, qsfsContainerNS, pkg.ContainerID(wlID)); err != nil {
+		return errors.Wrap(err, "couldn't stop qsfs container")
 	}
 	return nil
 }

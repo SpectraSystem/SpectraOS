@@ -2,7 +2,11 @@ package yggdrasil
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
+
+	"github.com/pkg/errors"
 )
 
 //PeerListFallback is an hardcoded list of public yggdrasil node
@@ -13,11 +17,11 @@ var PeerListFallback = Peers{
 		Up:       true,
 	},
 	{
-		Endpoint: "tcp://85.17.15.221:35239",
+		Endpoint: "tcp://51.15.204.214:12345",
 		Up:       true,
 	},
 	{
-		Endpoint: "tcp://51.255.223.60:64982",
+		Endpoint: "tls://51.255.223.60:54232",
 		Up:       true,
 	},
 }
@@ -33,6 +37,40 @@ type NodeInfo struct {
 
 // Peers is a peers list
 type Peers []NodeInfo
+
+type Filter func(ip net.IP) bool
+
+// Ranges is a list of net.IPNet
+type Ranges []net.IPNet
+
+// Exclude ranges, return IPs that are NOT in the given ranges
+func Exclude(ranges Ranges) Filter {
+	return func(ip net.IP) bool {
+		for _, n := range ranges {
+			if n.Contains(ip) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// Include ranges, return IPs that are IN one of the given ranges
+func Include(ranges Ranges) Filter {
+	return func(ip net.IP) bool {
+		for _, n := range ranges {
+			if n.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// IPV4Only is an IPFilter function that filters out non IPv4 address
+func IPV4Only(ip net.IP) bool {
+	return ip.To4() != nil
+}
 
 // FetchPeerList download the list of public yggdrasil peer from https://publicpeers.neilalexander.dev/publicnodes.json
 func FetchPeerList() (Peers, error) {
@@ -64,13 +102,37 @@ func FetchPeerList() (Peers, error) {
 }
 
 // Ups return all the peers that are marked up from the PeerList p
-func (p Peers) Ups() Peers {
+func (p Peers) Ups(filter ...Filter) (Peers, error) {
 	var peers Peers
+next:
 	for _, n := range p {
-		if n.Up {
-			peers = append(peers, n)
+		if !n.Up {
+			continue
 		}
+		if len(filter) == 0 {
+			peers = append(peers, n)
+			continue
+		}
+		// we have filters, we need to process the endpoint
+		u, err := url.Parse(n.Endpoint)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to parse: %s", err)
+		}
+		ips, err := net.LookupIP(u.Hostname())
+		if err != nil {
+			return nil, err
+		}
+
+		for _, ip := range ips {
+			for _, f := range filter {
+				if !f(ip) {
+					continue next
+				}
+			}
+		}
+
+		peers = append(peers, n)
 	}
 
-	return peers
+	return peers, nil
 }

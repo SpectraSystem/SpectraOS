@@ -1,14 +1,14 @@
 package latency
 
 import (
-	"bytes"
 	"context"
 	"net"
+	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 )
 
@@ -17,7 +17,6 @@ import (
 type Sorter struct {
 	endpoints []string
 	worker    int
-	filters   []IPFilter
 }
 
 // Result is the struct return by the LatencySorter
@@ -26,28 +25,12 @@ type Result struct {
 	Latency  time.Duration
 }
 
-// IPFilter is function used by Sorted to filters out IP address during the latency test
-type IPFilter func(net.IP) bool
-
-// IPV4Only is an IPFilter function that filters out non IPv4 address
-func IPV4Only(ip net.IP) bool {
-	return ip.To4() != nil
-}
-
-// ExcludePrefix is a IPFilter function that filters IPs that start with prefix
-func ExcludePrefix(prefix []byte) IPFilter {
-	return func(ip net.IP) bool {
-		return !bytes.HasPrefix(ip, prefix)
-	}
-}
-
 // NewSorter create a new LatencySorter that will sort endpoints by latency
 // you can controle the concurrency by tuning the worker value
-func NewSorter(endpoints []string, worker int, filters ...IPFilter) *Sorter {
+func NewSorter(endpoints []string, worker int) *Sorter {
 	return &Sorter{
 		endpoints: endpoints,
 		worker:    worker,
-		filters:   filters,
 	}
 }
 
@@ -62,21 +45,9 @@ func (l *Sorter) Run(ctx context.Context) []Result {
 				err  error
 			)
 
-			addr = cleanupEndpoint(endpoint)
-			host, _, err := net.SplitHostPort(addr)
+			addr, err = cleanupEndpoint(endpoint)
 			if err != nil {
-				continue
-			}
-
-			skip := false
-			for _, filter := range l.filters {
-				ip := net.ParseIP(host)
-				skip = !filter(ip)
-				if skip {
-					break
-				}
-			}
-			if skip {
+				log.Warn().Err(err).Str("endpoint", endpoint).Msg("cannot parse peer url")
 				continue
 			}
 
@@ -144,9 +115,10 @@ func Latency(host string) (time.Duration, error) {
 	return duration / (3 / 2), nil
 }
 
-func cleanupEndpoint(endpoint string) string {
-	if strings.HasPrefix(endpoint, "tcp://") || strings.HasPrefix(endpoint, "tls://") {
-		return endpoint[6:]
+func cleanupEndpoint(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse peer url")
 	}
-	return endpoint
+	return u.Host, nil
 }

@@ -135,17 +135,19 @@ func (r *Reporter) pushOne() ([]Consumption, error) {
 
 	report := item.(*Report)
 
-	// DEBUG
-	log.Debug().Int("len", len(report.Consumption)).Msgf("sending capacity report")
+	log.Info().Int("len", len(report.Consumption)).Msgf("sending capacity report")
 
 	consumptions := make([]substrate.Consumption, 0, len(report.Consumption))
 	for _, cmp := range report.Consumption {
 		log.Debug().Uint64("contract", uint64(cmp.ContractID)).Msg("has consumption to report")
 		consumptions = append(consumptions, cmp.Consumption)
 	}
-	if err := r.substrate.Report(r.identity, consumptions); err != nil {
+	hash, err := r.substrate.Report(r.identity, consumptions)
+	if err != nil {
 		return nil, errors.Wrap(err, "failed to publish consumption report")
 	}
+
+	log.Info().Str("hash", hash).Msg("report block hash")
 
 	// only removed if report is reported to substrate
 	// remove item from queue
@@ -171,7 +173,7 @@ func (r *Reporter) pusher(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(3 * time.Second):
+			case <-time.After(20 * time.Second):
 				continue
 			}
 		}
@@ -198,14 +200,14 @@ func (r *Reporter) synchronize(ctx context.Context, reported []Consumption) erro
 
 	// the idea here is that we bring ALL active node contracts from chain.
 	// then compare it with what we have atm (the one we just reported)
-	contracts, err := r.substrate.GetNodeContracts(r.nodeID, substrate.ContractState{IsCreated: true})
+	contracts, err := r.substrate.GetNodeContracts(r.nodeID)
 	if err != nil {
 		return err
 	}
 
 	for _, contract := range contracts {
 		// is there a consumption report for a contract
-		delete(local, contract.ContractID)
+		delete(local, contract)
 	}
 	// any LOCAL contract that is not in the map must be decommissioned
 	for _, local := range local {
@@ -238,6 +240,7 @@ func (r *Reporter) Run(ctx context.Context) error {
 	// `every` seconds
 report:
 	for {
+		log.Info().Msg("collecting consumption")
 		// align time.
 		u := time.Now().Unix()
 		u = (u / every) * every
@@ -254,11 +257,12 @@ report:
 			continue
 		}
 
-		log.Debug().Int("size", len(report.Consumption)).Msg("queue consumption report for reproting")
+		log.Info().Int("size", len(report.Consumption)).Msg("queue consumption report for reproting")
 		if err := r.push(report); err != nil {
 			log.Error().Err(err).Msg("failed to push capacity report")
 		}
 
+		log.Info().Msg("consumption report queued")
 		for {
 			select {
 			case <-ctx.Done():
