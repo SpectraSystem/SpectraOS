@@ -120,6 +120,20 @@ func (n *NodeClient) DeploymentGet(ctx context.Context, contractID uint64) (dl g
 	return dl, nil
 }
 
+// DeploymentGet gets a deployment via contract ID
+func (n *NodeClient) DeploymentChanges(ctx context.Context, contractID uint64) (changes []gridtypes.Workload, err error) {
+	const cmd = "zos.deployment.changes"
+	in := args{
+		"contract_id": contractID,
+	}
+
+	if err = n.bus.Call(ctx, n.nodeTwin, cmd, in, &changes); err != nil {
+		return changes, err
+	}
+
+	return changes, nil
+}
+
 // DeploymentDelete deletes a deployment, the node will make sure to decomission all deployments
 // and set all workloads to deleted. A call to Get after delete is valid
 func (n *NodeClient) DeploymentDelete(ctx context.Context, contractID uint64) error {
@@ -153,6 +167,17 @@ func (n *NodeClient) NetworkListWGPorts(ctx context.Context) ([]uint16, error) {
 
 	if err := n.bus.Call(ctx, n.nodeTwin, cmd, nil, &result); err != nil {
 		return nil, err
+	}
+
+	return result, nil
+}
+
+func (n *NodeClient) HasPublicIPv6(ctx context.Context) (bool, error) {
+	const cmd = "zos.network.has_ipv6"
+	var result bool
+
+	if err := n.bus.Call(ctx, n.nodeTwin, cmd, nil, &result); err != nil {
+		return false, err
 	}
 
 	return result, nil

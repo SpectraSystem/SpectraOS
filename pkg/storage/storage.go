@@ -23,6 +23,8 @@ import (
 )
 
 const (
+	// SSDOverProvisionFactor over provision factor for SSDs
+	SSDOverProvisionFactor = 2
 	// CacheTarget is the path where the cache disk is mounted
 	CacheTarget = "/var/cache"
 	// cacheLabel is the name of the cache
@@ -65,13 +67,7 @@ func New() (*Module, error) {
 	}
 
 	// go for a simple linear setup right now
-	err := s.initialize()
-
-	if err == nil {
-		log.Info().Msgf("Finished initializing storage module")
-	}
-
-	return s, err
+	return s, s.initialize()
 }
 
 // Total gives the total amount of storage available for a device type
@@ -175,7 +171,7 @@ func (s *Module) initialize() error {
 			// force ssd device for vms
 			typ = zos.SSDDevice
 
-			if device.Name() == "/dev/vdd" || device.Name() == "/dev/vde" {
+			if device.Path() == "/dev/vdd" || device.Path() == "/dev/vde" {
 				typ = zos.HDDDevice
 			}
 		}
@@ -645,7 +641,7 @@ func (s *Module) checkForCandidates(size gridtypes.Unit, mounted bool) ([]candid
 			Uint64("new size", reserved+uint64(size)).
 			Msgf("usage of pool %s", pool.Name())
 		// Make sure adding this filesystem would not bring us over the disk limit
-		if reserved+uint64(size) > usage.Size {
+		if reserved+uint64(size) > usage.Size*SSDOverProvisionFactor {
 			log.Info().Msgf("Disk does not have enough space left to hold filesystem")
 
 			if !poolIsMounted && !mounted {

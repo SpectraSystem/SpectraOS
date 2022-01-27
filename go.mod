@@ -6,11 +6,10 @@ require (
 	github.com/BurntSushi/toml v0.4.1
 	github.com/ChainSafe/go-schnorrkel v0.0.0-20210318173838-ccb5cd955283
 	github.com/Microsoft/go-winio v0.5.0 // indirect
-	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412
 	github.com/alexflint/go-filemutex v1.1.0
 	github.com/blang/semver v3.5.1+incompatible
-	github.com/btcsuite/btcd v0.22.0-beta // indirect
+	github.com/boltdb/bolt v1.3.1
 	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/cenkalti/backoff/v3 v3.2.2
 	github.com/centrifuge/go-substrate-rpc-client/v3 v3.0.2
@@ -27,12 +26,11 @@ require (
 	github.com/fsnotify/fsnotify v1.5.1
 	github.com/g0rbe/go-chattr v0.0.0-20190906133247-aa435a6a0a37
 	github.com/gizak/termui/v3 v3.1.0
-	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/go-redis/redis v6.15.9+incompatible
 	github.com/gofrs/flock v0.8.1 // indirect
 	github.com/gogo/googleapis v1.4.1 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
-	github.com/gomodule/redigo v2.0.0+incompatible
+	github.com/gomodule/redigo v1.8.8
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/handlers v0.0.0-20150720190736-60c7bfde3e33
@@ -55,20 +53,18 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/common v0.30.0 // indirect
 	github.com/prometheus/procfs v0.7.3 // indirect
-	github.com/rs/cors v1.8.0 // indirect
 	github.com/rs/zerolog v1.26.0
 	github.com/rusart/muxprom v0.0.0-20200609120753-9173fa27435a
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/safchain/ethtool v0.0.0-20201023143004-874930cb3ce0 // indirect
-	github.com/shirou/gopsutil v3.21.4-0.20210419000835-c7a38de76ee5+incompatible
+	github.com/shirou/gopsutil v3.21.11+incompatible
 	github.com/stretchr/objx v0.3.0 // indirect
 	github.com/stretchr/testify v1.7.0
 	github.com/threefoldtech/0-fs v1.3.1-0.20201203163303-d963de9adea7
-	github.com/threefoldtech/go-rmb v0.1.7
-	github.com/threefoldtech/substrate-client v0.0.0-20211231191725-b8f9d49d9a97
+	github.com/threefoldtech/go-rmb v0.1.10-0.20220127085422-3c3667e4fc58
+	github.com/threefoldtech/substrate-client v0.0.0-20220118133601-4e68945dc064
 	github.com/threefoldtech/zbus v0.1.5
 	github.com/tinylib/msgp v1.1.5 // indirect
-	github.com/tklauser/go-sysconf v0.3.9 // indirect
 	github.com/tyler-smith/go-bip39 v1.1.0
 	github.com/urfave/cli v1.22.5
 	github.com/urfave/cli/v2 v2.3.0
@@ -77,6 +73,7 @@ require (
 	github.com/vmihailenco/msgpack v4.0.4+incompatible // indirect
 	github.com/whs/nacl-sealed-box v0.0.0-20180930164530-92b9ba845d8d
 	github.com/yggdrasil-network/yggdrasil-go v0.4.0
+	github.com/yusufpapurcu/wmi v1.2.2 // indirect
 	go.opencensus.io v0.23.0 // indirect
 	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
 	golang.org/x/net v0.0.0-20211005001312-d4b1ae081e3b // indirect

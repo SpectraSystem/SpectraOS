@@ -5,7 +5,9 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -108,17 +110,16 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		config ZMachine
 	)
 	if vm.Exists(ctx, wl.ID.String()) {
-		return result, provision.ErrDidNotChange
+		return result, provision.ErrNoActionNeeded
 	}
 
 	if err := json.Unmarshal(wl.Data, &config); err != nil {
 		return result, errors.Wrap(err, "failed to decode reservation schema")
 	}
 	machine := pkg.VM{
-		Name:        wl.ID.String(),
-		CPU:         config.ComputeCapacity.CPU,
-		Memory:      config.ComputeCapacity.Memory,
-		Environment: config.Env,
+		Name:   wl.ID.String(),
+		CPU:    config.ComputeCapacity.CPU,
+		Memory: config.ComputeCapacity.Memory,
 	}
 	// Should config.Vaid() be called here?
 
@@ -137,8 +138,10 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 	result.ID = wl.ID.String()
 	result.IP = netConfig.IP.String()
 
-	deployment := provision.GetDeployment(ctx)
-
+	deployment, err := provision.GetDeployment(ctx)
+	if err != nil {
+		return result, errors.Wrap(err, "failed to get deployment")
+	}
 	networkInfo := pkg.VMNetworkInfo{
 		Nameservers: []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1"), net.ParseIP("2001:4860:4860::8888")},
 	}
@@ -222,10 +225,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		if err := flist.Unmount(ctx, wl.ID.String()); err != nil {
 			return result, errors.Wrapf(err, "failed to unmount flist: %s", wl.ID.String())
 		}
-		rootfsSize := config.Size
-		if rootfsSize < 250*gridtypes.Megabyte {
-			rootfsSize = 250 * gridtypes.Megabyte
-		}
+		rootfsSize := config.RootSize()
 		// create a persisted volume for the vm. we don't do it automatically
 		// via the flist, so we have control over when to decomission this volume.
 		// remounting in RW mode
@@ -284,6 +284,12 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 		if err := p.vmMounts(ctx, deployment, config.Mounts, true, &machine); err != nil {
 			return result, err
 		}
+		if config.Corex {
+			if err := p.copyFile("/usr/bin/corex", filepath.Join(mnt, "corex"), 0755); err != nil {
+				return result, errors.Wrap(err, "failed to inject corex binary")
+			}
+			entrypoint = "/corex --ipv6 -d 7 --interface eth0"
+		}
 	} else {
 		// if a VM the vm has to have at least one mount
 		if len(config.Mounts) == 0 {
@@ -333,6 +339,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 	machine.KernelArgs = cmd
 	machine.Boot = boot
 	machine.Entrypoint = entrypoint
+	machine.Environment = config.Env
 
 	if err = vm.Run(ctx, machine); err != nil {
 		// attempt to delete the vm, should the process still be lingering
@@ -341,6 +348,23 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 	}
 
 	return result, err
+}
+func (p *Primitives) copyFile(srcPath string, destPath string, permissions os.FileMode) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return errors.Wrapf(err, "Coludn't find %s on the node", srcPath)
+	}
+	defer src.Close()
+	dest, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, permissions)
+	if err != nil {
+		return errors.Wrapf(err, "Coludn't create %s file", destPath)
+	}
+	defer dest.Close()
+	_, err = io.Copy(dest, src)
+	if err != nil {
+		return errors.Wrapf(err, "Couldn't copy to %s", destPath)
+	}
+	return nil
 }
 
 func (p *Primitives) vmDecomission(ctx context.Context, wl *gridtypes.WorkloadWithID) error {
@@ -388,8 +412,9 @@ func (p *Primitives) vmDecomission(ctx context.Context, wl *gridtypes.WorkloadWi
 	}
 
 	if len(cfg.Network.PublicIP) > 0 {
-		deployment := provision.GetDeployment(ctx)
-		ipWl, err := deployment.Get(cfg.Network.PublicIP)
+		// TODO: we need to make sure workload status reflects the actual status by the engine
+		// this is not the case anymore.
+		ipWl, err := provision.GetWorkload(ctx, cfg.Network.PublicIP)
 		if err != nil {
 			return err
 		}
