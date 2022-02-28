@@ -149,14 +149,25 @@ func action(cli *cli.Context) error {
 		}
 	}()
 
-	node, twin, err := registration(ctx, redis, env, cap)
+	secureBoot, err := capacity.IsSecureBoot()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to detect secure boot flags")
+	}
+
+	var info RegistrationInfo
+	info = info.WithCapacity(cap).
+		WithSerialNumber(dmi.BoardVersion()).
+		WithSecureBoot(secureBoot).
+		WithVirtualized(len(hypervisor) != 0)
+
+	node, twin, err := registration(ctx, redis, env, info)
 	if err != nil {
 		return errors.Wrap(err, "failed during node registration")
 	}
 
-	sub, err := env.GetSubstrate()
+	sub, err := environment.GetSubstrate()
 	if err != nil {
-		return errors.Wrap(err, "failed to get connection to tfchain")
+		return err
 	}
 	events := events.New(sub, node)
 
@@ -201,6 +212,16 @@ func action(cli *cli.Context) error {
 		}
 	}()
 
+	// reporting stats
+	go func() {
+		for {
+			if err := reportStatistics(ctx, msgBrokerCon, redis); err != nil {
+				log.Error().Err(err).Msg("sending uptime failed")
+				<-time.After(10 * time.Second)
+			}
+		}
+	}()
+
 	log.Info().Uint32("twin", twin).Msg("node has been registered")
 	log.Debug().Msg("start message bus")
 	identityd := stubs.NewIdentityManagerStub(redis)
@@ -210,5 +231,5 @@ func action(cli *cli.Context) error {
 		return err
 	}
 
-	return runMsgBus(ctx, env.SubstrateURL, id)
+	return runMsgBus(ctx, sub, id)
 }

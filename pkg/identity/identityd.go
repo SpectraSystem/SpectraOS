@@ -15,7 +15,7 @@ import (
 
 type identityManager struct {
 	key KeyPair
-	sub *substrate.Substrate
+	sub substrate.Manager
 	env environment.Environment
 
 	farm string
@@ -52,7 +52,7 @@ func NewManager(path string) (pkg.IdentityManager, error) {
 		}
 	}
 
-	sub, err := substrate.NewSubstrate(env.SubstrateURL)
+	sub, err := environment.GetSubstrate()
 	if err != nil {
 		return nil, err
 	}
@@ -76,12 +76,18 @@ func (d *identityManager) NodeIDNumeric() (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	twin, err := d.sub.GetTwinByPubKey(id.PublicKey())
+	cl, err := d.sub.Substrate()
+	if err != nil {
+		return 0, err
+	}
+	defer cl.Close()
+
+	twin, err := cl.GetTwinByPubKey(id.PublicKey())
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to get node twin")
 	}
 
-	node, err := d.sub.GetNodeByTwinID(twin)
+	node, err := cl.GetNodeByTwinID(twin)
 	if err != nil {
 		return 0, err
 	}
@@ -94,7 +100,13 @@ func (d *identityManager) Farm() (string, error) {
 		return d.farm, nil
 	}
 
-	farm, err := d.sub.GetFarm(uint32(d.env.FarmerID))
+	cl, err := d.sub.Substrate()
+	if err != nil {
+		return "", err
+	}
+	defer cl.Close()
+
+	farm, err := cl.GetFarm(uint32(d.env.FarmerID))
 	if errors.Is(err, substrate.ErrNotFound) {
 		return "", fmt.Errorf("wrong farm id")
 	} else if err != nil {

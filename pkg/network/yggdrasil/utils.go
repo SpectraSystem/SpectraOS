@@ -3,40 +3,11 @@ package yggdrasil
 import (
 	"context"
 	"crypto/ed25519"
-	"time"
 
-	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zos/pkg/zinit"
 )
-
-func fetchPeerList() Peers {
-	// Try to fetch public peer
-	// If we failed to do so, use the fallback hardcoded peer list
-	var pl Peers
-
-	// Do not retry more than 4 times
-	bo := backoff.WithMaxRetries(backoff.NewConstantBackOff(time.Second), 4)
-
-	fetchPeerList := func() error {
-		p, err := FetchPeerList()
-		if err != nil {
-			log.Debug().Err(err).Msg("failed to fetch yggdrasil peers")
-			return err
-		}
-		pl = p
-		return nil
-	}
-
-	err := backoff.Retry(fetchPeerList, bo)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to read yggdrasil public peer list online, using fallback")
-		pl = PeerListFallback
-	}
-
-	return pl
-}
 
 func EnsureYggdrasil(ctx context.Context, privateKey ed25519.PrivateKey, ns YggdrasilNamespace) (*YggServer, error) {
 	// Filter out all the nodes from the same
@@ -52,7 +23,7 @@ func EnsureYggdrasil(ctx context.Context, privateKey ed25519.PrivateKey, ns Yggd
 			ranges = append(ranges, ip)
 		}
 	}
-
+	log.Info().Msgf("filtering out peers from ranges: %s", ranges)
 	filter := Exclude(ranges)
 	z := zinit.Default()
 
