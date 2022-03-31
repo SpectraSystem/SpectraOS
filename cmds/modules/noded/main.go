@@ -216,7 +216,7 @@ func action(cli *cli.Context) error {
 	go func() {
 		for {
 			if err := reportStatistics(ctx, msgBrokerCon, redis); err != nil {
-				log.Error().Err(err).Msg("sending uptime failed")
+				log.Error().Err(err).Msg("sending stats report failed")
 				<-time.After(10 * time.Second)
 			}
 		}
@@ -227,6 +227,7 @@ func action(cli *cli.Context) error {
 	identityd := stubs.NewIdentityManagerStub(redis)
 	sk := ed25519.PrivateKey(identityd.PrivateKey(ctx))
 	id, err := substrate.NewIdentityFromEd25519Key(sk)
+	log.Info().Str("address", id.Address()).Msg("node address")
 	if err != nil {
 		return err
 	}

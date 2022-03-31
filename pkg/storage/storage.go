@@ -165,7 +165,12 @@ func (s *Module) initialize() error {
 			log.Error().Err(err).Str("pool", pool.Name()).Str("device", device.Path).Msg("failed to get usage of pool")
 		}
 
-		typ := device.Type()
+		typ, err := device.Type()
+		if err != nil {
+			log.Error().Str("device", device.Path).Err(err).Msg("failed to check device type")
+			continue
+		}
+
 		if vm {
 			// force ssd device for vms
 			typ = zos.SSDDevice
@@ -197,7 +202,10 @@ func (s *Module) initialize() error {
 		}
 
 		for _, vol := range volumes {
-			if vol.Name() != zdbVolume {
+			if vol.Name() != zdbVolume && vol.Name() != cacheLabel {
+				// we don't delete zdb volumes, also zos-cache volumes
+				// although they should not exist on hdd for protection
+				// in case of error or bad detection of device speed.
 				if err := hdd.RemoveVolume(vol.Name()); err != nil {
 					log.Error().Err(err).
 						Str("volume", vol.Name()).
@@ -212,7 +220,7 @@ func (s *Module) initialize() error {
 		Int("ssd-pools", len(s.ssds)).
 		Int("hdd-pools", len(s.hdds)).
 		Int("broken-pools", len(s.brokenPools)).
-		Int("borken-devices", len(s.brokenDevices)).
+		Int("broken-devices", len(s.brokenDevices)).
 		Msg("pool creations completed")
 
 	s.dump()

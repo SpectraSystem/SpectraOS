@@ -42,7 +42,8 @@ const (
 	statisticsModule = "statistics"
 	gib              = 1024 * 1024 * 1024
 
-	boltStorageDB = "workloads.bolt"
+	boltStorageDB    = "workloads.bolt"
+	metricsStorageDB = "metrics.bolt"
 
 	// deprecated, kept for migration
 	fsStorageDB = "workloads"
@@ -78,8 +79,11 @@ func action(cli *cli.Context) error {
 		rootDir      string = cli.String("root")
 	)
 
-	ctx := context.Background()
-	ctx, _ = utils.WithSignal(ctx)
+	ctx, _ := utils.WithSignal(context.Background())
+
+	utils.OnDone(ctx, func(_ error) {
+		log.Info().Msg("shutting down")
+	})
 
 	// keep checking if limited-cache flag is set
 	if app.CheckFlag(app.LimitedCache) {
@@ -191,6 +195,7 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to get node reserved capacity")
 	}
 	var current gridtypes.Capacity
+	var active []gridtypes.Deployment
 	if !app.IsFirstBoot(serverName) {
 		// if this is the first boot of this module.
 		// it means the provision engine will still
@@ -199,7 +204,7 @@ func action(cli *cli.Context) error {
 		// since the counters will get populated anyway.
 		// but if not, we need to set the current counters
 		// from store.
-		current, err = store.Capacity()
+		current, active, err = store.Capacity()
 		if err != nil {
 			log.Error().Err(err).Msg("failed to compute current consumed capacity")
 		}
@@ -260,6 +265,21 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to create storage for queues")
 	}
 
+	setter := NewCapacitySetter(kp, mgr, store)
+
+	log.Info().Int("contracts", len(active)).Msg("setting used capacity by contracts")
+	if err := setter.Set(active...); err != nil {
+		log.Error().Err(err).Msg("failed to set capacity for active contracts")
+	}
+
+	log.Info().Msg("setting contracts used cpacity done")
+
+	go func() {
+		if err := setter.Run(ctx); err != nil {
+			log.Fatal().Err(err).Msg("capacity reporter exited unexpectedly")
+		}
+	}()
+
 	engine, err := provision.New(
 		store,
 		statistics,
@@ -280,6 +300,10 @@ func action(cli *cli.Context) error {
 		// if this is a node reboot, the node needs to
 		// recreate all reservations. so we set rerun = true
 		provision.WithRerunAll(app.IsFirstBoot(serverName)),
+		// Callback when a deployment changes capacity it must
+		// be called. this one used by the setter to set used
+		// capacity on chain.
+		provision.WithCallback(setter.Callback),
 	)
 
 	if err != nil {
@@ -316,16 +340,31 @@ func action(cli *cli.Context) error {
 		log.Error().Err(err).Msg("failed to mark module as booted")
 	}
 
-	reporter, err := NewReporter(engine, node, cl, queues)
+	handler := NewContractEventHandler(node, mgr, engine, cl)
+
+	go func() {
+		if err := handler.Run(ctx); err != nil && err != context.Canceled {
+			log.Fatal().Err(err).Msg("handling contracts events failed")
+		}
+	}()
+
+	reporter, err := NewReporter(filepath.Join(rootDir, metricsStorageDB), cl, queues)
 	if err != nil {
 		return errors.Wrap(err, "failed to setup capacity reporter")
 	}
+
 	// also spawn the capacity reporter
 	go func() {
-		if err := reporter.Run(ctx); err != nil && err != context.Canceled {
-			log.Fatal().Err(err).Msg("capacity reported stopped unexpectedely")
+		for {
+			err := reporter.Run(ctx)
+			if err == context.Canceled {
+				return
+			} else if err != nil {
+				log.Error().Err(err).Msg("capacity reported stopped unexpectedely")
+			}
+
+			<-time.After(10 * time.Second)
 		}
-		log.Info().Msg("capacity reported stopped")
 	}()
 
 	// and start the zbus server in the background
