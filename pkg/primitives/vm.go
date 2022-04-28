@@ -23,7 +23,7 @@ import (
 
 const (
 	// this probably need a way to update. for now just hard code it
-	cloudContainerFlist = "https://hub.grid.tf/azmy.3bot/cloud-container.flist"
+	cloudContainerFlist = "https://hub.grid.tf/azmy.3bot/cloud-container-ci.flist"
 	cloudContainerName  = "cloud-container"
 )
 
@@ -35,10 +35,11 @@ type ZMachineResult = zos.ZMachineResult
 
 // FListInfo virtual machine details
 type FListInfo struct {
-	Container bool
-	Initrd    string
-	Kernel    string
 	ImagePath string
+}
+
+func (t *FListInfo) IsContainer() bool {
+	return len(t.ImagePath) == 0
 }
 
 func (p *Primitives) virtualMachineProvision(ctx context.Context, wl *gridtypes.WorkloadWithID) (interface{}, error) {
@@ -208,18 +209,28 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 
 	log.Debug().Msgf("detected flist type: %+v", imageInfo)
 
-	var boot pkg.Boot
+	var (
+		boot       pkg.Boot
+		entrypoint string
+		kernel     string
+		initrd     string
+	)
 
-	// "root=/dev/vda rw console=ttyS0 reboot=k panic=1"
-	cmd := pkg.KernelArgs{
-		"rw":      "",
-		"console": "ttyS0",
-		"reboot":  "k",
-		"panic":   "1",
-		"root":    "/dev/vda",
+	// mount cloud-container flist (or reuse) which has kernel, initrd and also firmware
+	hash, err := flist.FlistHash(ctx, cloudContainerFlist)
+	if err != nil {
+		return zos.ZMachineResult{}, errors.Wrap(err, "failed to get cloud-container flist hash")
 	}
-	var entrypoint string
-	if imageInfo.Container {
+
+	// if the name changes (because flist changed, a new mount will be created)
+	name := fmt.Sprintf("%s:%s", cloudContainerName, hash)
+	// now mount cloud image also
+	cloudImage, err := flist.Mount(ctx, name, cloudContainerFlist, pkg.ReadOnlyMountOptions)
+	if err != nil {
+		return result, errors.Wrap(err, "failed to mount cloud container base image")
+	}
+
+	if imageInfo.IsContainer() {
 		// - if Container, remount RW
 		// prepare for container
 		if err := flist.Unmount(ctx, wl.ID.String()); err != nil {
@@ -253,22 +264,9 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 			return result, errors.Wrapf(err, "failed to mount flist: %s", wl.ID.String())
 		}
 
-		hash, err := flist.FlistHash(ctx, cloudContainerFlist)
-		if err != nil {
-			return zos.ZMachineResult{}, errors.Wrap(err, "failed to get cloud-container flist hash")
-		}
-
-		// if the name changes (because flist changed, a new mount will be created)
-		name := fmt.Sprintf("%s:%s", cloudContainerName, hash)
-
-		// now mount cloud image also
-		cloudImage, err := flist.Mount(ctx, name, cloudContainerFlist, pkg.ReadOnlyMountOptions)
-		if err != nil {
-			return result, errors.Wrap(err, "failed to mount cloud container base image")
-		}
 		// inject container kernel and init
-		imageInfo.Kernel = filepath.Join(cloudImage, "kernel")
-		imageInfo.Initrd = filepath.Join(cloudImage, "initramfs-linux.img")
+		kernel = filepath.Join(cloudImage, "kernel")
+		initrd = filepath.Join(cloudImage, "initramfs-linux.img")
 
 		boot = pkg.Boot{
 			Type: pkg.BootVirtioFS,
@@ -279,7 +277,6 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 			return result, errors.Wrap(err, "failed to apply startup config from flist")
 		}
 
-		cmd["host"] = string(wl.Name)
 		entrypoint = config.Entrypoint
 		if err := p.vmMounts(ctx, deployment, config.Mounts, true, &machine); err != nil {
 			return result, err
@@ -297,6 +294,7 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 			return result, err
 		}
 
+		kernel = filepath.Join(cloudImage, "hypervisor-fw")
 		var disk *gridtypes.WorkloadWithID
 		disk, err = deployment.Get(config.Mounts[0].Name)
 		if err != nil {
@@ -334,12 +332,12 @@ func (p *Primitives) virtualMachineProvisionImpl(ctx context.Context, wl *gridty
 	// - Attach mounts
 	// - boot
 	machine.Network = networkInfo
-	machine.KernelImage = imageInfo.Kernel
-	machine.InitrdImage = imageInfo.Initrd
-	machine.KernelArgs = cmd
+	machine.KernelImage = kernel
+	machine.InitrdImage = initrd
 	machine.Boot = boot
 	machine.Entrypoint = entrypoint
 	machine.Environment = config.Env
+	machine.Hostname = wl.Name.String()
 
 	if err = vm.Run(ctx, machine); err != nil {
 		// attempt to delete the vm, should the process still be lingering

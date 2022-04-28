@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -96,9 +95,13 @@ func (p *Primitives) newPrivNetworkInterface(ctx context.Context, dl gridtypes.D
 		return pkg.VMIface{}, errors.Wrap(err, "could not set up tap device")
 	}
 
+	// the mac address uses the global workload id
+	// this needs to be the same as how we get it in the actual IP reservation
+	mac := ifaceutil.HardwareAddrFromInputBytes([]byte(tapName))
+
 	out := pkg.VMIface{
 		Tap: iface,
-		MAC: "", // rely on static IP configuration so we don't care here
+		MAC: mac.String(),
 		IPs: []net.IPNet{
 			addrCIDR, privIP6,
 		},
@@ -180,29 +183,17 @@ func (p *Primitives) getPubIPConfig(wl *gridtypes.WorkloadWithID) (result zos.Pu
 }
 
 func getFlistInfo(imagePath string) (FListInfo, error) {
-	kernel := filepath.Join(imagePath, "kernel")
-	log.Debug().Str("file", kernel).Msg("checking kernel")
-	if _, err := os.Stat(kernel); os.IsNotExist(err) {
-		return FListInfo{Container: true}, nil
-	} else if err != nil {
-		return FListInfo{}, errors.Wrap(err, "couldn't stat /kernel")
-	}
-
-	initrd := filepath.Join(imagePath, "initrd")
-	log.Debug().Str("file", initrd).Msg("checking initrd")
-	if _, err := os.Stat(initrd); os.IsNotExist(err) {
-		initrd = "" // optional
-	} else if err != nil {
-		return FListInfo{}, errors.Wrap(err, "couldn't state /initrd")
-	}
-
 	image := imagePath + "/image.raw"
 	log.Debug().Str("file", image).Msg("checking image")
-	if _, err := os.Stat(image); err != nil {
+	_, err := os.Stat(image)
+
+	if os.IsNotExist(err) {
+		return FListInfo{}, nil
+	} else if err != nil {
 		return FListInfo{}, errors.Wrap(err, "couldn't stat /image.raw")
 	}
 
-	return FListInfo{Initrd: initrd, Kernel: kernel, ImagePath: image}, nil
+	return FListInfo{ImagePath: image}, nil
 }
 
 type startup struct {

@@ -5,17 +5,20 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+	"github.com/threefoldtech/zos/pkg/rotate"
 	"github.com/threefoldtech/zos/pkg/stubs"
 )
 
 const (
 	failuresBeforeDestroy = 4
 	monitorEvery          = 10 * time.Second
+	logrotateEvery        = 10 * time.Minute
 )
 
 var (
@@ -23,16 +26,46 @@ var (
 	// the monitoring will not try to restart this machine
 	// when it detects that it is down.
 	permanent = struct{}{}
+
+	rotator = rotate.NewRotator(
+		rotate.MaxSize(8*rotate.Megabytes),
+		rotate.TailSize(4*rotate.Megabytes),
+	)
 )
+
+func (m *Module) logrotate(ctx context.Context) error {
+	log.Debug().Msg("running log rotations for vms")
+	running, err := FindAll()
+	if err != nil {
+		return err
+	}
+
+	names := make([]string, 0, len(running))
+	for name := range running {
+		names = append(names, name)
+	}
+
+	return rotator.RotateAll(filepath.Join(m.root, logsDir), names...)
+}
 
 // Monitor start vms  monitoring
 func (m *Module) Monitor(ctx context.Context) {
+
 	go func() {
+		monTicker := time.NewTicker(monitorEvery)
+		defer monTicker.Stop()
+		logTicker := time.NewTicker(logrotateEvery)
+		defer logTicker.Stop()
+
 		for {
 			select {
-			case <-time.After(monitorEvery):
+			case <-monTicker.C:
 				if err := m.monitor(ctx); err != nil {
 					log.Error().Err(err).Msg("failed to run monitoring")
+				}
+			case <-logTicker.C:
+				if err := m.logrotate(ctx); err != nil {
+					log.Error().Err(err).Msg("failed to run log rotation")
 				}
 			case <-ctx.Done():
 				return
@@ -94,7 +127,7 @@ func (m *Module) monitorID(ctx context.Context, running map[string]Process, id s
 		// if the marker is permanent. it means that this vm
 		// is being deleted or not monitored. we don't need to take any more action here
 		// (don't try to restart or delete)
-		os.RemoveAll(m.configPath(id))
+		m.removeConfig(id)
 		return nil
 	}
 
@@ -132,7 +165,7 @@ func (m *Module) monitorID(ctx context.Context, running map[string]Process, id s
 
 	if reason != nil {
 		log.Debug().Err(reason).Msg("deleting vm due to restart error")
-		os.RemoveAll(m.configPath(id))
+		m.removeConfig(id)
 
 		stub := stubs.NewProvisionStub(m.client)
 		if err := stub.DecommissionCached(ctx, id, reason.Error()); err != nil {

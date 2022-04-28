@@ -17,6 +17,7 @@ import (
 	"github.com/blang/semver"
 
 	"github.com/threefoldtech/zos/pkg/cache"
+	"github.com/threefoldtech/zos/pkg/gridtypes/zos"
 	"github.com/threefoldtech/zos/pkg/network/ndmz"
 	"github.com/threefoldtech/zos/pkg/network/public"
 	"github.com/threefoldtech/zos/pkg/network/tuntap"
@@ -265,7 +266,7 @@ func (n networker) createMacVlan(iface string, master string, hw net.HardwareAdd
 
 // SetupTap interface in the network resource. We only allow 1 tap interface to be
 // set up per NR currently
-func (n *networker) SetupPrivTap(networkID pkg.NetID, name string) (string, error) {
+func (n *networker) SetupPrivTap(networkID pkg.NetID, name string) (ifc string, err error) {
 	log.Info().Str("network-id", string(networkID)).Msg("Setting up tap interface")
 
 	localNR, err := n.networkOf(string(networkID))
@@ -286,10 +287,6 @@ func (n *networker) SetupPrivTap(networkID pkg.NetID, name string) (string, erro
 	tapIface, err := tapName(name)
 	if err != nil {
 		return "", errors.Wrap(err, "could not get network namespace tap device name")
-	}
-
-	if ifaceutil.Exists(tapIface, nil) {
-		return tapIface, nil
 	}
 
 	_, err = tuntap.CreateTap(tapIface, bridgeName)
@@ -827,6 +824,10 @@ func (n *networker) DeleteNR(netNR pkg.Network) error {
 	}
 
 	return nil
+}
+
+func (n *networker) Namespace(id zos.NetID) string {
+	return fmt.Sprintf("n-%s", id)
 }
 
 // Set node public namespace config
