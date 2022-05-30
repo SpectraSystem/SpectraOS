@@ -110,12 +110,19 @@ func (s *Module) DiskFormat(name string) error {
 	return s.ensureFS(path)
 }
 
-// DiskWrite writes image to disk
+// DiskWrite writes image to disk. Disk will not be changed
+// if it already has a filesystem or partition table.
 func (s *Module) DiskWrite(name string, image string) error {
 	path, err := s.findDisk(name)
 	if err != nil {
 		return errors.Wrapf(err, "couldn't find disk with id: %s", name)
 	}
+
+	if !s.isEmptyDisk(path) {
+		log.Debug().Str("disk", path).Msg("disk already has a filesystem. no write")
+		return nil
+	}
+
 	source, err := os.Open(image)
 	if err != nil {
 		return errors.Wrap(err, "failed to open image")
@@ -171,6 +178,8 @@ func (s *Module) DiskCreate(name string, size gridtypes.Unit) (disk pkg.VDisk, e
 		}
 	}()
 
+	defer syscall.Sync()
+
 	var file *os.File
 	file, err = os.Create(path)
 	if err != nil {
@@ -182,8 +191,11 @@ func (s *Module) DiskCreate(name string, size gridtypes.Unit) (disk pkg.VDisk, e
 		return disk, err
 	}
 
-	err = syscall.Fallocate(int(file.Fd()), 0, 0, int64(size))
-	return pkg.VDisk{Path: path, Size: int64(size)}, err
+	if err = syscall.Fallocate(int(file.Fd()), 0, 0, int64(size)); err != nil {
+		return disk, errors.Wrap(err, "failed to truncate disk to size")
+	}
+
+	return pkg.VDisk{Path: path, Size: int64(size)}, nil
 }
 
 // DiskCreate with given size, return path to virtual disk (size in MB)
@@ -200,8 +212,11 @@ func (s *Module) DiskResize(name string, size gridtypes.Unit) (disk pkg.VDisk, e
 
 	defer file.Close()
 
-	err = syscall.Fallocate(int(file.Fd()), 0, 0, int64(size))
-	return pkg.VDisk{Path: path, Size: int64(size)}, err
+	if err = syscall.Fallocate(int(file.Fd()), 0, 0, int64(size)); err != nil {
+		return disk, errors.Wrap(err, "failed to truncate disk to size")
+	}
+
+	return pkg.VDisk{Path: path, Size: int64(size)}, nil
 }
 
 func (s *Module) ensureFS(disk string) error {
@@ -221,6 +236,14 @@ func (s *Module) ensureFS(disk string) error {
 	}
 
 	return errors.Wrapf(err, "unknown btrfs error '%s'", string(output))
+}
+
+// isEmptyDisk return true, if disk file has no partition table or filesystem
+// else, returns false
+func (s *Module) isEmptyDisk(disk string) bool {
+	err := exec.Command("blkid", disk).Run()
+
+	return err != nil
 }
 
 func (s *Module) safePath(base, id string) (string, error) {

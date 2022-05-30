@@ -483,10 +483,19 @@ func (m *Module) waitAndAdjOom(ctx context.Context, name string) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	if err := backoff.Retry(check, backoff.WithContext(backoff.NewConstantBackOff(2*time.Second), ctx)); err != nil {
+	if err := backoff.RetryNotify(
+		check,
+		backoff.WithContext(
+			backoff.NewConstantBackOff(2*time.Second),
+			ctx,
+		),
+		func(err error, d time.Duration) {
+			log.Debug().Err(err).Str("id", name).Msg("vm is not up yet")
+		}); err != nil {
+
 		return err
 	}
 
@@ -599,4 +608,20 @@ func (m *Module) Delete(name string) error {
 	}
 
 	return nil
+}
+
+func (m *Module) Lock(name string, lock bool) error {
+	// todo: should we do locking here?
+	if !m.Exists(name) {
+		return fmt.Errorf("machine '%s' does not exist", name)
+	}
+
+	ctx := context.Background()
+
+	client := NewClient(m.socketPath(name))
+	if lock {
+		return client.Pause(ctx)
+	} else {
+		return client.Resume(ctx)
+	}
 }

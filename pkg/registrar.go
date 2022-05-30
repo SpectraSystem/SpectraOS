@@ -1,1 +1,10 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/1c72d0a08e9027c0575820cc8573ddb6
+package pkg
+
+//go:generate mkdir -p stubs
+
+//go:generate zbusc -module registrar -version 0.0.1 -name registrar -package stubs github.com/threefoldtech/zos/pkg+Registrar stubs/registrar_stub.go
+
+type Registrar interface {
+	NodeID() (uint32, error)
+	TwinID() (uint32, error)
+}

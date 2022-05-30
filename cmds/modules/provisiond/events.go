@@ -95,9 +95,14 @@ func (r *ContractEventHandler) Run(ctx context.Context) error {
 	// take into account the following:
 	// every is in seconds.
 	events := stubs.NewEventsStub(r.cl)
-	stream, err := events.ContractCancelledEvent(ctx)
+	cancellation, err := events.ContractCancelledEvent(ctx)
 	if err != nil {
 		return errors.Wrap(err, "failed to register to node events")
+	}
+
+	locking, err := events.ContractLockedEvent(ctx)
+	if err != nil {
+		return err
 	}
 
 	if err := r.sync(ctx); err != nil {
@@ -117,7 +122,7 @@ func (r *ContractEventHandler) Run(ctx context.Context) error {
 					log.Error().Err(err).Msg("failed to synchronize contracts with the chain")
 				}
 			}()
-		case event := <-stream:
+		case event := <-cancellation:
 			if event.Kind == pkg.EventSubscribed {
 				// we run this in a go routine because we don't
 				// want synchronization of contracts on the chain (that can take some time)
@@ -133,11 +138,26 @@ func (r *ContractEventHandler) Run(ctx context.Context) error {
 			log.Debug().Msgf("received a cancel contract event %+v", event)
 
 			// otherwise we know what contract to be deleted
-			if err := r.engine.Deprovision(ctx, event.TwinId, event.Contract, "contract canceled"); err != nil {
+			if err := r.engine.Deprovision(ctx, event.TwinId, event.Contract, "contract canceled event received"); err != nil {
 				log.Error().Err(err).
 					Uint32("twin", event.TwinId).
 					Uint64("contract", event.Contract).
 					Msg("failed to decomission contract")
+			}
+		case event := <-locking:
+			// todo. we might need to try to sync all contracts to real state if we
+			// missed events. so another way to sync here.
+			action := r.engine.Resume
+			if event.Lock {
+				action = r.engine.Pause
+			}
+
+			if err := action(ctx, event.TwinId, event.Contract); err != nil {
+				log.Error().Err(err).
+					Uint32("twin", event.TwinId).
+					Uint64("contract", event.Contract).
+					Bool("lock", event.Lock).
+					Msg("failed to set deployment locking contract")
 			}
 		}
 	}
