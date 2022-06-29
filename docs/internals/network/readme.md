@@ -1,1 +1,8 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/a2bf50f9966872734e4373df5949b5c1
+# zos networking
+
+## Index
+
+- [definitions of the vocabulary used in the documentation](definitions.md)
+- [Introduction to networkd, the network manager of 0-OS](introduction.md)
+- [Detail about the wireguard mesh used to interconnect 0-OS nodes](mesh.md)
+- [Documentation for farmer on how to setup the network of their farm](setup_farm_network.md)
