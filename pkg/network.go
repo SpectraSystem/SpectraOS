@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"reflect"
 
@@ -34,6 +35,34 @@ type YggdrasilTap struct {
 	HW      net.HardwareAddr
 	IP      net.IPNet
 	Gateway net.IPNet
+}
+
+type Interface struct {
+	Name string
+	IPs  []net.IPNet
+	Mac  string
+}
+
+type ExitDevice struct {
+	// IsSingle is set to true if br-pub
+	// is connected to zos bridge
+	IsSingle bool `json:"is_single"`
+	// IsDual is set to true if br-pub is
+	// connected to a physical nic
+	IsDual bool `json:"is_dual"`
+	// AsDualInterface is set to the physical
+	// interface name if IsDual is true
+	AsDualInterface string `json:"dual_interface"`
+}
+
+func (e *ExitDevice) String() string {
+	if e.IsSingle {
+		return "single"
+	} else if e.IsDual {
+		return fmt.Sprintf("dual(%s)", e.AsDualInterface)
+	}
+
+	return "unknown"
 }
 
 //Networker is the interface for the network module
@@ -146,17 +175,32 @@ type Networker interface {
 
 	// Addrs return the IP addresses of interface
 	// if the interface is in a network namespace netns needs to be not empty
+	// if iface is empty, return ALL interfaces in the given namespace
+	// if they are physical
+	Interfaces(iface string, netns string) (map[string]Interface, error)
+
+	// Addrs return the IP addresses of interface
+	// if the interface is in a network namespace netns needs to be not empty
+	// [obsolete] please use Interfaces instead
 	Addrs(iface string, netns string) (ips []net.IP, mac string, err error)
 
 	WireguardPorts() ([]uint, error)
 
 	// Public Config
 
-	// Set node public namespace config
+	// Set node public namespace config.
 	SetPublicConfig(cfg PublicConfig) error
+
+	// UnsetPublicConfig removes public config from node
+	UnsetPublicConfig() error
 
 	// Get node public namespace config
 	GetPublicConfig() (PublicConfig, error)
+
+	// GetPublicExitDevice either return "singe" or "dual(<nic>)"
+	GetPublicExitDevice() (ExitDevice, error)
+
+	SetPublicExitDevice(iface string) error
 
 	// Monitoring methods
 
@@ -209,6 +253,10 @@ type PublicConfig struct {
 	// Domain is the node domain name like gent01.devnet.grid.tf
 	// or similar
 	Domain string `json:"domain"`
+}
+
+func (p *PublicConfig) IsEmpty() bool {
+	return p.IPv4.Nil() && p.IPv6.Nil()
 }
 
 func PublicConfigFrom(cfg substrate.PublicConfig) (pub PublicConfig, err error) {
