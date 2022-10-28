@@ -3,10 +3,8 @@ package provisiond
 import (
 	"context"
 	"crypto/ed25519"
-	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/cenkalti/backoff/v3"
@@ -205,6 +203,10 @@ func action(cli *cli.Context) error {
 		}
 	}
 
+	if err := netResourceMigration(active); err != nil {
+		log.Error().Err(err).Msg("failed to migrate network resources")
+	}
+
 	log.Debug().Msgf("current used capacity: %+v", current)
 	// statistics collects information about workload statistics
 	// also does some checks on capacity
@@ -329,7 +331,7 @@ func action(cli *cli.Context) error {
 		}
 	}()
 
-	if err := app.MarkBooted(provisionModule); err != nil {
+	if err := app.MarkBooted(serverName); err != nil {
 		log.Error().Err(err).Msg("failed to mark module as booted")
 	}
 
@@ -418,50 +420,4 @@ func getNodeReserved(cl zbus.Client, available gridtypes.Capacity) (counter prim
 	)
 
 	return
-}
-
-func storageMigration(db *storage.BoltStorage, fs *fsStorage.Fs) error {
-	log.Info().Msg("starting storage migration")
-	twins, err := fs.Twins()
-	if err != nil {
-		return err
-	}
-	migration := db.Migration()
-	errorred := false
-	for _, twin := range twins {
-		dls, err := fs.ByTwin(twin)
-		if err != nil {
-			log.Error().Err(err).Uint32("twin", twin).Msg("failed to list twin deployments")
-			continue
-		}
-
-		sort.Slice(dls, func(i, j int) bool {
-			return dls[i] < dls[j]
-		})
-
-		for _, dl := range dls {
-			log.Info().Uint32("twin", twin).Uint64("deployment", dl).Msg("processing deployment migration")
-			deployment, err := fs.Get(twin, dl)
-			if err != nil {
-				log.Error().Err(err).Uint32("twin", twin).Uint64("deployment", dl).Msg("failed to get deployment")
-				errorred = true
-				continue
-			}
-			if err := migration.Migrate(deployment); err != nil {
-				log.Error().Err(err).Uint32("twin", twin).Uint64("deployment", dl).Msg("failed to migrate deployment")
-				errorred = true
-				continue
-			}
-			if err := fs.Delete(deployment); err != nil {
-				log.Error().Err(err).Uint32("twin", twin).Uint64("deployment", dl).Msg("failed to delete migrated deployment")
-				continue
-			}
-		}
-	}
-
-	if errorred {
-		return fmt.Errorf("not all deployments where migrated")
-	}
-
-	return nil
 }
