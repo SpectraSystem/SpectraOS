@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/rusart/muxprom"
+	"github.com/threefoldtech/rmb-sdk-go"
 	"github.com/threefoldtech/substrate-client"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/app"
@@ -23,7 +24,6 @@ import (
 	"github.com/threefoldtech/zos/pkg/provision/mbus"
 	"github.com/threefoldtech/zos/pkg/provision/storage"
 	fsStorage "github.com/threefoldtech/zos/pkg/provision/storage.fs"
-	"github.com/threefoldtech/zos/pkg/rmb"
 	"github.com/urfave/cli/v2"
 
 	"github.com/threefoldtech/zos/pkg/stubs"
@@ -231,7 +231,7 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to create substrate users database")
 	}
 
-	admins, err := provision.NewSubstrateAdmins(mgr, uint32(env.FarmerID))
+	admins, err := provision.NewSubstrateAdmins(mgr, uint32(env.FarmID))
 	if err != nil {
 		return errors.Wrap(err, "failed to create substrate admins database")
 	}
@@ -383,7 +383,7 @@ func action(cli *cli.Context) error {
 		log.Info().Msg("zbus server stopped")
 	}()
 
-	mBus, err := rmb.New(msgBrokerCon)
+	mBus, err := rmb.NewRouter(msgBrokerCon)
 	if err != nil {
 		return errors.Wrap(err, "Failed to initialize message bus")
 	}
@@ -394,6 +394,8 @@ func action(cli *cli.Context) error {
 	if err := primitives.NewStatisticsMessageBus(zosRouter, statistics); err != nil {
 		return errors.Wrap(err, "failed to create statistics api")
 	}
+
+	setupStorageRmb(zosRouter, cl)
 
 	_ = mbus.NewDeploymentMessageBus(zosRouter, engine)
 
@@ -426,4 +428,12 @@ func getNodeReserved(cl zbus.Client, available gridtypes.Capacity) (counter grid
 	)
 
 	return
+}
+
+func setupStorageRmb(router rmb.Router, cl zbus.Client) {
+	storage := router.Subroute("storage")
+	storage.WithHandler("pools", func(ctx context.Context, payload []byte) (interface{}, error) {
+		stub := stubs.NewStorageModuleStub(cl)
+		return stub.Metrics(ctx)
+	})
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 
+	"github.com/threefoldtech/rmb-sdk-go"
 	"github.com/threefoldtech/substrate-client"
 	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/capacity"
@@ -19,7 +20,6 @@ import (
 	"github.com/threefoldtech/zos/pkg/events"
 	"github.com/threefoldtech/zos/pkg/monitord"
 	"github.com/threefoldtech/zos/pkg/registrar"
-	"github.com/threefoldtech/zos/pkg/rmb"
 	"github.com/threefoldtech/zos/pkg/stubs"
 	"github.com/threefoldtech/zos/pkg/utils"
 
@@ -143,7 +143,7 @@ func action(cli *cli.Context) error {
 		WithVirtualized(len(hypervisor) != 0)
 
 	go registerationServer(ctx, msgBrokerCon, env, info)
-	bus, err := rmb.New(msgBrokerCon)
+	bus, err := rmb.NewRouter(msgBrokerCon)
 	if err != nil {
 		return errors.Wrap(err, "failed to initialize message bus server")
 	}
@@ -217,7 +217,7 @@ func action(cli *cli.Context) error {
 		return err
 	}
 
-	events, err := events.NewRedisStream(sub, msgBrokerCon, node, eventsBlock)
+	events, err := events.NewRedisStream(sub, msgBrokerCon, env.FarmID, node, eventsBlock)
 	if err != nil {
 		return err
 	}
@@ -264,35 +264,18 @@ func action(cli *cli.Context) error {
 		return err
 	}
 
-	// uptime update
-	go func() {
-		defer log.Info().Msg("uptime reporting exited permanently")
-		safeUptime := func(ctx context.Context, redis zbus.Client) (err error) {
-			defer func() {
-				if p := recover(); p != nil {
-					err = fmt.Errorf("uptime reporting has panicked: %+v", p)
-				}
-			}()
-
-			err = uptime(ctx, id)
-			return err
-		}
-
-		for {
-			err := safeUptime(ctx, redis)
-			if errors.Is(err, context.Canceled) {
-				log.Info().Msg("stop uptime reporting. context cancelled")
-				return
-			} else if err != nil {
-				log.Error().Err(err).Msg("sending uptime failed")
-			}
-			// even there is no error we try again until ctx is cancelled
-			<-time.After(10 * time.Second)
-		}
-	}()
-
 	log.Debug().Msg("start message bus")
-	return runMsgBus(ctx, sub, id)
+	for {
+		err := runMsgBus(ctx, sk, env.SubstrateURL, env.RelayURL, msgBrokerCon)
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// if context is cancelled, then it's a normal shutdown
+			return nil
+		}
+
+		log.Error().Err(err).Msg("rmb-peer exited with an error, restarting")
+		<-time.After(1 * time.Second)
+	}
 }
 
 func retryNotify(err error, d time.Duration) {

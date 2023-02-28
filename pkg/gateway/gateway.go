@@ -3,9 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -112,7 +110,7 @@ func domainFromRule(rule string) (string, error) {
 
 // domainFromConfig returns workloadID, domain, error
 func domainFromConfig(path string) (string, string, error) {
-	buf, err := ioutil.ReadFile(path)
+	buf, err := os.ReadFile(path)
 	if err != nil {
 		return "", "", errors.Wrap(err, "failed to read file")
 	}
@@ -144,7 +142,7 @@ func domainFromConfig(path string) (string, string, error) {
 
 func loadDomains(ctx context.Context, dir string) (map[string]string, error) {
 	domains := make(map[string]string)
-	entries, err := ioutil.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read dir")
 	}
@@ -566,22 +564,13 @@ func (g *gatewayModule) setupRouting(wlID string, fqdn string, backends []string
 	}
 	servers := make([]Server, len(backends))
 	for idx, backend := range backends {
+		if err := zos.Backend(backend).Valid(TLSPassthrough); err != nil {
+			return errors.Wrapf(err, "failed to validate backend '%s'", backend)
+		}
 		if TLSPassthrough {
-			if err := zos.Backend(backend).Valid(true); err != nil {
-				return errors.Wrap(err, "couldn't validate backend host")
-			}
-			u, err := url.Parse(backend)
-			log.Debug().Str("hostname", u.Host).Str("backend", backend).Msg("tls passthrough")
-			if err != nil {
-				return errors.Wrap(err, "couldn't parse backend host")
-			}
-			servers[idx] = Server{
-				Address: u.Host,
-			}
+			servers[idx] = Server{Address: backend}
 		} else {
-			servers[idx] = Server{
-				Url: backend,
-			}
+			servers[idx] = Server{Url: backend}
 		}
 	}
 	route := fmt.Sprintf("%s-route", wlID)
