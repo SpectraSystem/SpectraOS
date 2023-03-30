@@ -32,23 +32,31 @@ var (
 	_ provision.Provisioner = (*Statistics)(nil)
 )
 
+type Reserved func() (gridtypes.Capacity, error)
+
 // Statistics a provisioner interceptor that keeps track
 // of consumed capacity. It also does validate of required
 // capacity and then can report that this capacity can not be fulfilled
 type Statistics struct {
 	inner    provision.Provisioner
 	total    gridtypes.Capacity
-	reserved gridtypes.Capacity
+	reserved Reserved
 	storage  provision.Storage
 	mem      gridtypes.Unit
 }
 
 // NewStatistics creates a new statistics provisioner interceptor.
 // Statistics provisioner keeps track of used capacity and update explorer when it changes
-func NewStatistics(total gridtypes.Capacity, storage provision.Storage, reserved gridtypes.Capacity, inner provision.Provisioner) *Statistics {
+func NewStatistics(total gridtypes.Capacity, storage provision.Storage, reserved Reserved, inner provision.Provisioner) *Statistics {
 	vm, err := mem.VirtualMemory()
 	if err != nil {
 		panic(err)
+	}
+
+	if reserved == nil {
+		reserved = func() (gridtypes.Capacity, error) {
+			return gridtypes.Capacity{}, nil
+		}
 	}
 
 	return &Statistics{
@@ -60,17 +68,31 @@ func NewStatistics(total gridtypes.Capacity, storage provision.Storage, reserved
 	}
 }
 
-// Get all used capacity from storage + reserved
-func (s *Statistics) active() (gridtypes.Capacity, error) {
-	cap, _, err := s.storage.Capacity()
-	cap.Add(&s.reserved)
-	return cap, err
+type activeCounters struct {
+	// used capacity from storage + reserved
+	cap gridtypes.Capacity
+	// Total deployments count
+	deployments int
+	// Total workloads count
+	workloads int
 }
 
-// Current returns the current used capacity including reserved capacity
-// used by the system
-func (s *Statistics) Current() (gridtypes.Capacity, error) {
-	return s.active()
+// Get all used capacity from storage + reserved / deployments count and workloads count
+func (s *Statistics) active() (activeCounters, error) {
+	storageCap, err := s.storage.Capacity()
+	if err != nil {
+		return activeCounters{}, err
+	}
+	reserved, err := s.reserved()
+	if err != nil {
+		return activeCounters{}, err
+	}
+	storageCap.Cap.Add(&reserved)
+	return activeCounters{
+		storageCap.Cap,
+		len(storageCap.Deployments),
+		storageCap.Workloads,
+	}, err
 }
 
 // Total returns the node total capacity
@@ -85,7 +107,8 @@ func (s *Statistics) getUsableMemoryBytes() (gridtypes.Capacity, gridtypes.Unit,
 	// [[R][ WL ]                 ]
 	// [[    actual    ]          ]
 
-	cap, err := s.active()
+	activeCounters, err := s.active()
+	cap := activeCounters.cap
 	if err != nil {
 		return cap, 0, err
 	}
@@ -178,12 +201,26 @@ func (s *statisticsMessageBus) setup(router rmb.Router) error {
 	return nil
 }
 
+// UsersCounters the expected counters for deployments and workloads
+type UsersCounters struct {
+	// Total deployments count
+	Deployments int `json:"deployments"`
+	// Total workloads count
+	Workloads int `json:"workloads"`
+}
+
 func (s *statisticsMessageBus) getCounters(ctx context.Context, payload []byte) (interface{}, error) {
 
-	used, err := s.stats.Current()
+	activeCounters, err := s.stats.active()
 	if err != nil {
 		return nil, err
 	}
+
+	reserved, err := s.stats.reserved()
+	if err != nil {
+		return nil, err
+	}
+
 	return struct {
 		// Total system capacity
 		Total gridtypes.Capacity `json:"total"`
@@ -191,10 +228,16 @@ func (s *statisticsMessageBus) getCounters(ctx context.Context, payload []byte) 
 		Used gridtypes.Capacity `json:"used"`
 		// System resource reserved by zos
 		System gridtypes.Capacity `json:"system"`
+		// Users statistics by zos
+		Users UsersCounters `json:"users"`
 	}{
 		Total:  s.stats.Total(),
-		Used:   used,
-		System: s.stats.reserved,
+		Used:   activeCounters.cap,
+		System: reserved,
+		Users: UsersCounters{
+			Deployments: activeCounters.deployments,
+			Workloads:   activeCounters.workloads,
+		},
 	}, nil
 }
 
@@ -215,11 +258,11 @@ func (s *statsStream) ReservedStream(ctx context.Context) <-chan gridtypes.Capac
 			case <-ctx.Done():
 				return
 			case <-time.After(2 * time.Minute):
-				used, err := s.stats.Current()
+				activeCounters, err := s.stats.active()
 				if err != nil {
 					log.Error().Err(err).Msg("failed to get used capacity")
 				}
-				ch <- used
+				ch <- activeCounters.cap
 			}
 		}
 	}(ctx)
@@ -227,7 +270,8 @@ func (s *statsStream) ReservedStream(ctx context.Context) <-chan gridtypes.Capac
 }
 
 func (s *statsStream) Current() (gridtypes.Capacity, error) {
-	return s.stats.Current()
+	activeCounters, err := s.stats.active()
+	return activeCounters.cap, err
 }
 
 func (s *statsStream) Total() gridtypes.Capacity {

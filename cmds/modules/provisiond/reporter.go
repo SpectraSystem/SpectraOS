@@ -43,6 +43,15 @@ func reportBuilder() interface{} {
 	return &Report{}
 }
 
+func ReportChecks(metricsPath string) error {
+	rrd, err := rrd.NewRRDBolt(metricsPath, 5*time.Minute, 24*time.Hour)
+	if err != nil {
+		return errors.Wrap(err, "failed to create metrics database")
+	}
+
+	return rrd.Close()
+}
+
 // NewReporter creates a new capacity reporter
 func NewReporter(metricsPath string, cl zbus.Client, root string) (*Reporter, error) {
 	idMgr := stubs.NewIdentityManagerStub(cl)
@@ -199,16 +208,16 @@ func (r *Reporter) getGwMetrics(ctx context.Context, slot rrd.Slot) error {
 	if err != nil {
 		return err
 	}
-	sent := metrics.Sent
-	recv := metrics.Received
+	requests := metrics.Request
+	responses := metrics.Response
 
 	sums := make(map[string]float64)
-	for wl, v := range sent {
-		sums[wl] = v + recv[wl]
-		delete(recv, wl)
+	for wl, v := range requests {
+		sums[wl] = v + responses[wl]
+		delete(responses, wl)
 	}
 
-	for wl, v := range recv {
+	for wl, v := range responses {
 		sums[wl] = v
 	}
 
@@ -282,6 +291,11 @@ func (r *Reporter) getLastReportTime() (int64, bool, error) {
 		return 0, false, errors.Wrap(err, "failed to get timestamp of last report")
 	}
 	return int64(stored), ok, nil
+}
+
+func (r *Reporter) Close() {
+	_ = r.rrd.Close()
+	_ = r.queue.Close()
 }
 
 // Run runs the reporter

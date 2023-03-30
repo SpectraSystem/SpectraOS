@@ -1,9 +1,12 @@
 package provisiond
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -66,26 +69,77 @@ var Module cli.Command = cli.Command{
 			Usage: "connection string to the message `BROKER`",
 			Value: "unix:///var/run/redis.sock",
 		},
-		&cli.StringFlag{
-			Name:  "http",
-			Usage: "http listen address",
-			Value: ":2021",
+		&cli.BoolFlag{
+			Name:  "integrity",
+			Usage: "run some integrity checks on some files",
 		},
 	},
 	Action: action,
+}
+
+// integrityChecks are started in a separate process because
+// we found out that some weird db corruption causing the process
+// to receive a SIGBUS error
+// while we can catch the sigbus and handle it ourselves i thought
+// it's better to do it in a separate process to always have a clean
+// state
+func integrityChecks(ctx context.Context, rootDir string) error {
+	err := ReportChecks(filepath.Join(rootDir, metricsStorageDB))
+
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+
+	return err
+}
+
+// runChecks starts provisiond with the special flag `--integrity` which runs some
+// checks and return an error if checks did not pass.
+// if an error is received the db files are cleaned
+func runChecks(ctx context.Context, rootDir string) error {
+	log.Info().Msg("run integrity checks")
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "--root", rootDir, "--integrity")
+	var buf bytes.Buffer
+	cmd.Stderr = &buf
+
+	cmd.CombinedOutput()
+	err := cmd.Run()
+	if err == context.Canceled {
+		return err
+	} else if err == nil {
+		return nil
+	}
+
+	log.Error().Str("stderr", buf.String()).Err(err).Msg("integrity check failed, resetting rrd db")
+
+	// other error, we can try to clean up and continue
+	return os.RemoveAll(filepath.Join(rootDir, metricsStorageDB))
 }
 
 func action(cli *cli.Context) error {
 	var (
 		msgBrokerCon string = cli.String("broker")
 		rootDir      string = cli.String("root")
+		integrity    bool   = cli.Bool("integrity")
 	)
 
 	ctx, _ := utils.WithSignal(context.Background())
 
+	if integrity {
+		return integrityChecks(ctx, rootDir)
+	}
+
 	utils.OnDone(ctx, func(_ error) {
 		log.Info().Msg("shutting down")
 	})
+
+	// run integrityChecks
+	if err := runChecks(ctx, rootDir); err != nil {
+		return errors.Wrap(err, "error running integrity checks")
+	}
 
 	// keep checking if limited-cache flag is set
 	if app.CheckFlag(app.LimitedCache) {
@@ -187,11 +241,6 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to get node capacity")
 	}
 
-	// update initial capacity with
-	reserved, err := getNodeReserved(cl, cap)
-	if err != nil {
-		return errors.Wrap(err, "failed to get node reserved capacity")
-	}
 	var current gridtypes.Capacity
 	var active []gridtypes.Deployment
 	if !app.IsFirstBoot(serverName) {
@@ -202,7 +251,9 @@ func action(cli *cli.Context) error {
 		// since the counters will get populated anyway.
 		// but if not, we need to set the current counters
 		// from store.
-		current, active, err = store.Capacity()
+		storageCap, err := store.Capacity()
+		current = storageCap.Cap
+		active = storageCap.Deployments
 		if err != nil {
 			log.Error().Err(err).Msg("failed to compute current consumed capacity")
 		}
@@ -218,7 +269,7 @@ func action(cli *cli.Context) error {
 	statistics := primitives.NewStatistics(
 		cap,
 		store,
-		reserved,
+		getNodeReserved(cl, cap),
 		provisioners,
 	)
 
@@ -270,7 +321,7 @@ func action(cli *cli.Context) error {
 		log.Error().Err(err).Msg("failed to set capacity for active contracts")
 	}
 
-	log.Info().Msg("setting contracts used cpacity done")
+	log.Info().Msg("setting contracts used capacity done")
 
 	go func() {
 		if err := setter.Run(ctx); err != nil {
@@ -332,7 +383,7 @@ func action(cli *cli.Context) error {
 	// spawn the engine
 	go func() {
 		if err := engine.Run(ctx); err != nil && err != context.Canceled {
-			log.Fatal().Err(err).Msg("provision engine exited unexpectedely")
+			log.Fatal().Err(err).Msg("provision engine exited unexpectedly")
 		}
 	}()
 
@@ -363,12 +414,14 @@ func action(cli *cli.Context) error {
 
 	// also spawn the capacity reporter
 	go func() {
+		defer reporter.Close()
+
 		for {
 			err := reporter.Run(ctx)
 			if err == context.Canceled {
 				return
 			} else if err != nil {
-				log.Error().Err(err).Msg("capacity reported stopped unexpectedely")
+				log.Error().Err(err).Msg("capacity reported stopped unexpectedly")
 			}
 
 			<-time.After(10 * time.Second)
@@ -378,7 +431,7 @@ func action(cli *cli.Context) error {
 	// and start the zbus server in the background
 	go func() {
 		if err := server.Run(ctx); err != nil && err != context.Canceled {
-			log.Fatal().Err(err).Msg("zbus provision engine api exited unexpectedely")
+			log.Fatal().Err(err).Msg("zbus provision engine api exited unexpectedly")
 		}
 		log.Info().Msg("zbus server stopped")
 	}()
@@ -413,21 +466,22 @@ func action(cli *cli.Context) error {
 	return nil
 }
 
-func getNodeReserved(cl zbus.Client, available gridtypes.Capacity) (counter gridtypes.Capacity, err error) {
-	// fill in reserved storage
-	storage := stubs.NewStorageModuleStub(cl)
-	fs, err := storage.Cache(context.TODO())
-	if err != nil {
-		return counter, err
+func getNodeReserved(cl zbus.Client, available gridtypes.Capacity) primitives.Reserved {
+	return func() (counter gridtypes.Capacity, err error) {
+		storage := stubs.NewStorageModuleStub(cl)
+		fs, err := storage.Cache(context.TODO())
+		if err != nil {
+			return counter, err
+		}
+
+		counter.SRU += fs.Usage.Size
+		counter.MRU += gridtypes.Max(
+			available.MRU*10/100,
+			2*gridtypes.Gigabyte,
+		)
+
+		return
 	}
-
-	counter.SRU += fs.Usage.Size
-	counter.MRU += gridtypes.Max(
-		available.MRU*10/100,
-		2*gridtypes.Gigabyte,
-	)
-
-	return
 }
 
 func setupStorageRmb(router rmb.Router, cl zbus.Client) {
