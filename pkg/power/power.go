@@ -9,7 +9,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
-	"github.com/threefoldtech/substrate-client"
+	substrate "github.com/threefoldtech/tfchain/clients/tfchain-client-go"
 	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/events"
@@ -164,8 +164,14 @@ func (p *PowerServer) powerUp(node *substrate.Node, reason string) error {
 		return fmt.Errorf("can't find mac address of node '%d'", node.ID)
 	}
 
-	return exec.Command("ether-wake", "-i", "zos", mac).Run()
+	for i := 0; i < 10; i++ {
+		if err := exec.Command("ether-wake", "-i", "zos", mac).Run(); err != nil {
+			log.Error().Err(err).Msg("failed to send WOL")
+		}
+		<-time.After(500 * time.Millisecond)
+	}
 
+	return nil
 }
 
 func (p *PowerServer) shutdown() error {
