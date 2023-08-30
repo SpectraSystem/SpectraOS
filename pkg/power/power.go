@@ -60,10 +60,6 @@ const (
 	PowerServerPort  = 8039
 )
 
-var (
-	errConnectionError = fmt.Errorf("connection error")
-)
-
 func EnsureWakeOnLan(ctx context.Context) (bool, error) {
 	inf, err := bridge.Get(DefaultWolBridge)
 	if err != nil {
@@ -126,8 +122,7 @@ func (p *PowerServer) syncSelf() error {
 	// if target is down, we make sure state is down, then shutdown
 
 	if power.Target.IsUp {
-		if power.State.IsDown {
-			_, err = cl.SetNodePowerState(p.identity, true)
+		if err := p.setNodePowerState(cl, true); err != nil {
 			return errors.Wrap(err, "failed to set state to up")
 		}
 
@@ -137,9 +132,8 @@ func (p *PowerServer) syncSelf() error {
 	// now the target must be down.
 	// we need to shutdown
 
-	if power.State.IsUp {
-		_, err = cl.SetNodePowerState(p.identity, false)
-		return errors.Wrap(err, "failed to set state to up")
+	if err := p.setNodePowerState(cl, false); err != nil {
+		return errors.Wrap(err, "failed to set state to down")
 	}
 
 	// otherwise node need to get back to sleep.
@@ -220,7 +214,7 @@ func (p *PowerServer) event(event *pkg.PowerTargetChangeEvent) error {
 
 	if event.NodeID == p.node && event.Target.IsDown {
 		// we need to shutdown!
-		if _, err := cl.SetNodePowerState(p.identity, false); err != nil {
+		if err := p.setNodePowerState(cl, false); err != nil {
 			return errors.Wrap(err, "failed to set node power state to down")
 		}
 
@@ -237,19 +231,67 @@ func (p *PowerServer) event(event *pkg.PowerTargetChangeEvent) error {
 	return nil
 }
 
+// setNodePowerState sets the node power state as provided or to up if power mgmt is
+// not enabled on this node.
+// this function makes sure to compare the state with on chain state to not do
+// un-necessary transactions.
+func (p *PowerServer) setNodePowerState(cl *substrate.Substrate, up bool) error {
+
+	/*
+		if power is not enabled, the node state should always be up
+		otherwise update the state to the correct value
+
+		| enabled | up | result|
+		| 0       | 0  | 1     |
+		| 0       | 1  | 1     |
+		| 1       | 0  | 0     |
+		| 1       | 1  | 1     |
+
+		this simplifies as below:
+	*/
+
+	up = !p.enabled || up
+	power, err := cl.GetPowerTarget(p.node)
+
+	if err != nil {
+		return errors.Wrap(err, "failed to check power state")
+	}
+
+	// only update the chain if it's different from actual value.
+	if power.State.IsUp == up {
+		return nil
+	}
+
+	log.Info().Bool("state", up).Msg("setting node power state")
+	// this to make sure node state is fixed also for nodes
+	_, err = cl.SetNodePowerState(p.identity, up)
+	return err
+}
+
 func (p *PowerServer) recv(ctx context.Context) error {
 	log.Info().Msg("listening for power events")
-	stream, err := p.consumer.PowerTargetChange(ctx)
+
+	if err := p.syncSelf(); err != nil {
+		return errors.Wrap(err, "failed to synchronize power status")
+	}
+
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stream, err := p.consumer.PowerTargetChange(subCtx)
 	if err != nil {
-		return errors.Wrapf(errConnectionError, "failed to connect to zbus events: %s", err)
+		return errors.Wrap(err, "failed to connect to zbus events")
 	}
 
 	for event := range stream {
 		if err := p.event(&event); err != nil {
-			log.Error().Err(err).Msg("failed to process power event")
+			return errors.Wrap(err, "failed to process power event")
 		}
 	}
 
+	// if we reach here it means stream was ended. this can only happen
+	// if and only if the steam was over and that can only be via a ctx
+	// cancel.
 	return nil
 }
 
@@ -257,25 +299,21 @@ func (p *PowerServer) recv(ctx context.Context) error {
 func (p *PowerServer) events(ctx context.Context) error {
 	// first thing we need to make sure we are not suppose to be powered
 	// off, so we need to sync with grid
-	// 1) make sure at least one uptime was already sent
+	// make sure at least one uptime was already sent
 	_ = p.ut.Mark.Done(ctx)
-	// 2) do we need to power off
-	if err := p.syncSelf(); err != nil {
-		return errors.Wrap(err, "failed to synchronize power status")
-	}
 
 	// if the stream loop fails for any reason retry
 	// unless context was cancelled
 	for {
 		err := p.recv(ctx)
-		if err == nil {
-			return err
+		if err != nil {
+			log.Error().Err(err).Msg("failed to process power events")
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/centrifuge/go-substrate-rpc-client/v4/types"
 	"github.com/gomodule/redigo/redis"
@@ -236,11 +237,18 @@ func (r *RedisConsumer) consumer(ctx context.Context, stream string, ch reflect.
 	logger := log.With().Str("stream", stream).Logger()
 	go func() {
 		defer con.Close()
+		defer ch.Close()
 
 		for {
 			messages, err := r.pop(con, group, stream)
 			if err != nil {
 				logger.Error().Err(err).Msg("failed to get events from")
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+					continue
+				}
 			}
 
 			for _, message := range messages {

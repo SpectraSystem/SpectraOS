@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,7 +41,7 @@ const (
 // to keep 0-OS up to date
 type Upgrader struct {
 	zinit        *zinit.Client
-	cache        string
+	root         string
 	noSelfUpdate bool
 	hub          HubClient
 	storage      storage.Storage
@@ -80,9 +81,15 @@ func Zinit(socket string) func(u *Upgrader) error {
 }
 
 // NewUpgrader creates a new upgrader instance
-func NewUpgrader(cache string, opts ...UpgraderOption) (*Upgrader, error) {
+func NewUpgrader(root string, opts ...UpgraderOption) (*Upgrader, error) {
 	u := &Upgrader{
-		cache: cache,
+		root: root,
+	}
+
+	for _, dir := range []string{u.fileCache(), u.flistCache()} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, errors.Wrap(err, "failed to prepare cache directories")
+		}
 	}
 
 	for _, opt := range opts {
@@ -108,7 +115,11 @@ func NewUpgrader(cache string, opts ...UpgraderOption) (*Upgrader, error) {
 }
 
 func (u *Upgrader) flistCache() string {
-	return filepath.Join(u.cache, "flist")
+	return filepath.Join(u.root, "cache", "flist")
+}
+
+func (u *Upgrader) fileCache() string {
+	return filepath.Join(u.root, "cache", "files")
 }
 
 // Upgrade is the method that does a full upgrade flow
@@ -226,7 +237,12 @@ func (u *Upgrader) ensureRestarted(service ...string) error {
 
 // UninstallBinary  from a single flist.
 func (u *Upgrader) UninstallBinary(flist FListInfo) error {
-	return u.uninstall(flist)
+	// we never delete those files from the system
+	// since there is no `package manager` for zos (yet)
+	// deleting the files from the flist blindly can cause
+	// issues if some deleted files were shared between
+	// multiple packages.
+	return u.uninstall(flist, false)
 }
 
 // upgradeSelf will try to check if the flist has
@@ -284,7 +300,9 @@ func (u *Upgrader) upgradeSelf(store meta.Walker) error {
 	return ErrRestartNeeded
 }
 
-func (u *Upgrader) uninstall(flist FListInfo) error {
+// uninstall a package, if del is true, also delete the files in that package
+// from the system filesystem
+func (u *Upgrader) uninstall(flist FListInfo, del bool) error {
 	files, err := flist.Files()
 	if err != nil {
 		return errors.Wrapf(err, "failed to get list of current installed files for '%s'", flist.Absolute())
@@ -324,6 +342,10 @@ func (u *Upgrader) uninstall(flist FListInfo) error {
 		if err := u.zinit.Forget(name); err != nil {
 			log.Error().Err(err).Str("service", name).Msg("error on zinit forget")
 		}
+	}
+
+	if !del {
+		return nil
 	}
 
 	// now delete ALL files, ignore what doesn't delete
@@ -367,7 +389,7 @@ func (u *Upgrader) applyUpgrade(from, to FullFListInfo) error {
 		return err
 	}
 
-	if err := u.uninstall(from.FListInfo); err != nil {
+	if err := u.uninstall(from.FListInfo, true); err != nil {
 		log.Error().Err(err).Msg("failed to uninstall current flist. Upgraded anyway")
 	}
 
@@ -552,14 +574,19 @@ func (u *Upgrader) copyFile(dst string, src meta.Meta) error {
 		}()
 	}
 
-	downloader := rofs.NewDownloader(u.storage, src)
 	fDst, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|os.O_SYNC, os.FileMode(src.Info().Access.Mode))
 	if err != nil {
 		return err
 	}
 	defer fDst.Close()
 
-	if err = downloader.Download(fDst); err != nil {
+	cache := rofs.NewCache(u.fileCache(), u.storage)
+	fSrc, err := cache.CheckAndGet(src)
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(fDst, fSrc); err != nil {
 		return err
 	}
 
