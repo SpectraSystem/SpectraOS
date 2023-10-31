@@ -16,6 +16,8 @@ const (
 	// VirtualMachine forces zos to think it's running
 	// on a virtual machine. used mainly for development
 	VirtualMachine = "zos-debug-vm"
+	// if disable-gpu flag is provided gpu feature will be disabled on that node
+	DisableGPU = "disable-gpu"
 )
 
 // Params represent the parameters passed to the kernel at boot
@@ -36,9 +38,30 @@ func (k Params) Get(key string) ([]string, bool) {
 	return v, ok
 }
 
+// GetOne gets a single value for given key. If key is provided
+// multiple times in the cmdline, the last one is used. If key does
+// not exist, or has no associated value, a false is returned
+func (k Params) GetOne(key string) (string, bool) {
+	all, found := k.Get(key)
+	if !found {
+		return "", false
+	}
+
+	if len(all) == 0 {
+		return "", false
+	}
+
+	return all[len(all)-1], true
+}
+
 // IsDebug checks if zos-debug is set
 func (k Params) IsDebug() bool {
 	return k.Exists(Debug)
+}
+
+// GPUDisabled checks if gpu is diabled
+func (k Params) IsGPUDisabled() bool {
+	return k.Exists(DisableGPU)
 }
 
 // IsVirtualMachine checks if zos-debug-vm is set

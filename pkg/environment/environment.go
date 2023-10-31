@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"sync"
 
+	"slices"
+
 	"github.com/pkg/errors"
 	substrate "github.com/threefoldtech/tfchain/clients/tfchain-client-go"
 	"github.com/threefoldtech/zos/pkg"
@@ -16,10 +18,24 @@ const (
 	baseExtendedURL = "https://raw.githubusercontent.com/threefoldtech/zos-config/main/"
 )
 
+// PubMac specify how the mac address of the public nic
+// (in case of public-config) is calculated
+type PubMac string
+
+const (
+	// PubMacRandom means the mac of the public nic will be chosen by the system
+	// the value won't change across reboots, but is based on the node id
+	// (default)
+	PubMacRandom PubMac = "random"
+	// PubMacSwap means the value of the mac is swapped with the physical nic
+	// where the public traffic is eventually going through
+	PubMacSwap PubMac = "swap"
+)
+
 // Environment holds information about running environment of a node
 // it defines the different constant based on the running mode (dev, test, prod)
 type Environment struct {
-	RunningMode RunningMode
+	RunningMode RunMode
 
 	FlistURL string
 	BinRepo  string
@@ -27,18 +43,34 @@ type Environment struct {
 	FarmID pkg.FarmID
 	Orphan bool
 
-	FarmSecret    string
-	SubstrateURL  []string
-	RelayURL      string
+	FarmSecret   string
+	SubstrateURL []string
+	// IMPORTANT NOTICE:
+	//   SINCE RELAYS FOR A NODE IS STORED ON THE CHAIN IN A LIMITED SPACE
+	//   PLEASE MAKE SURE THAT ANY ENV HAS NO MORE THAN FOUR RELAYS CONFIGURED
+	RelayURL      []string
 	ActivationURL string
+	GraphQL       string
 
 	ExtendedConfigURL string
+
+	// private vlan to join
+	// if set, zos will use this as its priv vlan
+	PrivVlan *uint16
+
+	// pub vlan to join
+	// if set, zos will use this as it's pub vlan
+	// only in a single nic setup
+	PubVlan *uint16
+
+	// PubMac value from environment
+	PubMac PubMac
 }
 
-// RunningMode type
-type RunningMode string
+// RunMode type
+type RunMode string
 
-func (r RunningMode) String() string {
+func (r RunMode) String() string {
 	switch r {
 	case RunningDev:
 		return "development"
@@ -56,13 +88,13 @@ func (r RunningMode) String() string {
 // Possible running mode of a node
 const (
 	// RunningDev mode
-	RunningDev RunningMode = "dev"
+	RunningDev RunMode = "dev"
 	// RunningQA mode
-	RunningQA RunningMode = "qa"
+	RunningQA RunMode = "qa"
 	// RunningTest mode
-	RunningTest RunningMode = "test"
+	RunningTest RunMode = "test"
 	// RunningMain mode
-	RunningMain RunningMode = "prod"
+	RunningMain RunMode = "prod"
 
 	// Orphanage is the default farmid where nodes are registered
 	// if no farmid were specified on the kernel command line
@@ -80,10 +112,13 @@ var (
 		SubstrateURL: []string{
 			"wss://tfchain.dev.grid.tf/",
 		},
-		RelayURL:      "wss://relay.dev.grid.tf",
+		RelayURL: []string{
+			"wss://relay.dev.grid.tf",
+		},
 		ActivationURL: "https://activation.dev.grid.tf/activation/activate",
 		FlistURL:      "redis://hub.grid.tf:9900",
 		BinRepo:       "tf-zos-v3-bins.dev",
+		GraphQL:       "https://graphql.dev.grid.tf/graphql",
 	}
 
 	envTest = Environment{
@@ -91,10 +126,13 @@ var (
 		SubstrateURL: []string{
 			"wss://tfchain.test.grid.tf/",
 		},
-		RelayURL:      "wss://relay.test.grid.tf",
+		RelayURL: []string{
+			"wss://relay.test.grid.tf",
+		},
 		ActivationURL: "https://activation.test.grid.tf/activation/activate",
 		FlistURL:      "redis://hub.grid.tf:9900",
 		BinRepo:       "tf-zos-v3-bins.test",
+		GraphQL:       "https://graphql.test.grid.tf/graphql",
 	}
 
 	envQA = Environment{
@@ -102,10 +140,13 @@ var (
 		SubstrateURL: []string{
 			"wss://tfchain.qa.grid.tf/",
 		},
-		RelayURL:      "wss://relay.qa.grid.tf",
+		RelayURL: []string{
+			"wss://relay.qa.grid.tf",
+		},
 		ActivationURL: "https://activation.qa.grid.tf/activation/activate",
 		FlistURL:      "redis://hub.grid.tf:9900",
 		BinRepo:       "tf-zos-v3-bins.qanet",
+		GraphQL:       "https://graphql.qa.grid.tf/graphql",
 	}
 
 	envProd = Environment{
@@ -116,10 +157,13 @@ var (
 			"wss://03.tfchain.grid.tf/",
 			"wss://04.tfchain.grid.tf/",
 		},
-		RelayURL:      "wss://relay.grid.tf",
+		RelayURL: []string{
+			"wss://relay.grid.tf",
+		},
 		ActivationURL: "https://activation.grid.tf/activation/activate",
 		FlistURL:      "redis://hub.grid.tf:9900",
 		BinRepo:       "tf-zos-v3-bins",
+		GraphQL:       "https://graphql.grid.tf/graphql",
 	}
 )
 
@@ -169,7 +213,7 @@ func getEnvironmentFromParams(params kernel.Params) (Environment, error) {
 		runmode = string(RunningMain)
 	}
 
-	switch RunningMode(runmode) {
+	switch RunMode(runmode) {
 	case RunningDev:
 		env = envDev
 	case RunningQA:
@@ -195,7 +239,7 @@ func getEnvironmentFromParams(params kernel.Params) (Environment, error) {
 
 	if relay, ok := params.Get("relay"); ok {
 		if len(relay) > 0 {
-			env.RelayURL = relay[len(relay)-1]
+			env.RelayURL = relay
 		}
 	}
 
@@ -232,6 +276,39 @@ func getEnvironmentFromParams(params kernel.Params) (Environment, error) {
 			return env, errors.Wrap(err, "wrong format for farm ID")
 		}
 		env.FarmID = pkg.FarmID(id)
+	}
+
+	if vlan, found := params.GetOne("vlan:priv"); found {
+		if !slices.Contains([]string{"none", "untagged", "un"}, vlan) {
+			tag, err := strconv.ParseUint(vlan, 10, 16)
+			if err != nil {
+				return env, errors.Wrap(err, "failed to parse priv vlan value")
+			}
+			tagU16 := uint16(tag)
+			env.PrivVlan = &tagU16
+		}
+	}
+
+	if vlan, found := params.GetOne("vlan:pub"); found {
+		if !slices.Contains([]string{"none", "untagged", "un"}, vlan) {
+			tag, err := strconv.ParseUint(vlan, 10, 16)
+			if err != nil {
+				return env, errors.Wrap(err, "failed to parse pub vlan value")
+			}
+			tagU16 := uint16(tag)
+			env.PubVlan = &tagU16
+		}
+	}
+
+	if mac, found := params.GetOne("pub:mac"); found {
+		v := PubMac(mac)
+		if slices.Contains([]PubMac{PubMacRandom, PubMacSwap}, v) {
+			env.PubMac = v
+		} else {
+			env.PubMac = PubMacRandom
+		}
+	} else {
+		env.PubMac = PubMacRandom
 	}
 
 	// Checking if there environment variable
