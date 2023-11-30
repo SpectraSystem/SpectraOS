@@ -21,9 +21,9 @@ import (
 	"github.com/threefoldtech/zos/pkg/events"
 	"github.com/threefoldtech/zos/pkg/monitord"
 	"github.com/threefoldtech/zos/pkg/perf"
-	"github.com/threefoldtech/zos/pkg/perf/publicip"
 	"github.com/threefoldtech/zos/pkg/perf/cpubench"
 	"github.com/threefoldtech/zos/pkg/perf/iperf"
+	"github.com/threefoldtech/zos/pkg/perf/publicip"
 	"github.com/threefoldtech/zos/pkg/registrar"
 	"github.com/threefoldtech/zos/pkg/stubs"
 	"github.com/threefoldtech/zos/pkg/utils"
@@ -216,13 +216,16 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to run the scheduler")
 	}
 	bus.WithHandler("zos.perf.get", func(ctx context.Context, payload []byte) (interface{}, error) {
-		var taskName string
-		err := json.Unmarshal(payload, &taskName)
+		type Payload struct {
+			Name string
+		}
+		var request Payload
+		err := json.Unmarshal(payload, &request)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to unmarshal payload: %v", payload)
 		}
 
-		return perfMon.Get(taskName)
+		return perfMon.Get(request.Name)
 	})
 	bus.WithHandler("zos.perf.get_all", func(ctx context.Context, payload []byte) (interface{}, error) {
 		return perfMon.GetAll()

@@ -2,13 +2,11 @@
 
 The goal of the task is to make sure public IPs assigned to a farm are valid and can be assigned to deployments.
 
-## Schedule
+### Configuration
 
-The task is scheduled to run 4 times a day.
+- Name: `public-ip-validation`
+- Schedule: 4 times a day
 
-## Task ID
-
-`PublicIPValidation`
 
 ## Task Details
 
@@ -27,3 +25,18 @@ The task is scheduled to run 4 times a day.
 ## Result
 
 The task only returns a single map of String (IP) to IPReport. The report consists of the IP state (valid, invalid or skipped) and the reason for the state.
+
+### Result sample
+```json
+{
+  "description": "Runs on the least NodeID node in a farm to validate all its IPs.",
+  "name": "public-ip-validation",
+  "result": {
+    "185.206.122.29/24": {
+      "reason": "public ip or gateway data are not valid",
+      "state": "invalid"
+    }
+  },
+  "timestamp": 1700504421
+}
+```
