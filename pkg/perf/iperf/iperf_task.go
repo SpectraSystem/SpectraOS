@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
+	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zos/pkg/environment"
@@ -17,12 +19,17 @@ import (
 	"github.com/threefoldtech/zos/pkg/perf/graphql"
 )
 
+const (
+	maxRetries      = 3
+	initialInterval = 5 * time.Minute
+	maxInterval     = 20 * time.Minute
+	maxElapsedTime  = time.Duration(maxRetries) * maxInterval
+
+	errServerBusy = "the server is busy running a test. try again later"
+)
+
 // IperfTest for iperf tcp/udp tests
-type IperfTest struct {
-	taskID      string
-	schedule    string
-	description string
-}
+type IperfTest struct{}
 
 // IperfResult for iperf test results
 type IperfResult struct {
@@ -43,26 +50,27 @@ func NewTask() perf.Task {
 	for _, match := range matches {
 		os.RemoveAll(match)
 	}
-	return &IperfTest{
-		taskID:      "iperf",
-		schedule:    "0 0 */6 * * *",
-		description: "Test public nodes network performance with both UDP and TCP over IPv4 and IPv6",
-	}
+	return &IperfTest{}
 }
 
 // ID returns the ID of the tcp task
 func (t *IperfTest) ID() string {
-	return t.taskID
+	return "iperf"
 }
 
 // Cron returns the schedule for the tcp task
 func (t *IperfTest) Cron() string {
-	return t.schedule
+	return "0 0 */6 * * *"
 }
 
 // Description returns the task description
 func (t *IperfTest) Description() string {
-	return t.description
+	return "Test public nodes network performance with both UDP and TCP over IPv4 and IPv6"
+}
+
+// Jitter returns the max number of seconds the job can sleep before actual execution.
+func (t *IperfTest) Jitter() uint32 {
+	return 20 * 60
 }
 
 // Run runs the tcp test and returns the result
@@ -137,16 +145,30 @@ func (t *IperfTest) runIperfTest(ctx context.Context, clientIP string, tcp bool)
 	if !tcp {
 		opts = append(opts, "--length", "16B", "--udp")
 	}
-	output, err := exec.CommandContext(ctx, "iperf", opts...).CombinedOutput()
-	exitErr := &exec.ExitError{}
-	if err != nil && !errors.As(err, &exitErr) {
-		log.Err(err).Msg("failed to run iperf")
-		return IperfResult{}
-	}
 
 	var report iperfCommandOutput
-	if err := json.Unmarshal(output, &report); err != nil {
-		log.Err(err).Msg("failed to parse iperf output")
+	operation := func() error {
+		res := runIperfCommand(ctx, opts)
+		if res.Error == errServerBusy {
+			return fmt.Errorf(errServerBusy)
+		}
+
+		report = res
+		return nil
+	}
+
+	notify := func(err error, waitTime time.Duration) {
+		log.Debug().Err(err).Stringer("retry-in", waitTime).Msg("retrying")
+	}
+
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = initialInterval
+	bo.MaxInterval = maxInterval
+	bo.MaxElapsedTime = maxElapsedTime
+
+	b := backoff.WithMaxRetries(bo, maxRetries)
+	err := backoff.RetryNotify(operation, b, notify)
+	if err != nil {
 		return IperfResult{}
 	}
 
@@ -154,6 +176,7 @@ func (t *IperfTest) runIperfTest(ctx context.Context, clientIP string, tcp bool)
 	if !tcp {
 		proto = "udp"
 	}
+
 	iperfResult := IperfResult{
 		UploadSpeed:   report.End.SumSent.BitsPerSecond,
 		DownloadSpeed: report.End.SumReceived.BitsPerSecond,
@@ -162,10 +185,26 @@ func (t *IperfTest) runIperfTest(ctx context.Context, clientIP string, tcp bool)
 		TestType:      proto,
 		Error:         report.Error,
 	}
-
 	if !tcp && len(report.End.Streams) > 0 {
 		iperfResult.DownloadSpeed = report.End.Streams[0].UDP.BitsPerSecond
 	}
 
 	return iperfResult
+}
+
+func runIperfCommand(ctx context.Context, opts []string) iperfCommandOutput {
+	output, err := exec.CommandContext(ctx, "iperf", opts...).CombinedOutput()
+	exitErr := &exec.ExitError{}
+	if err != nil && !errors.As(err, &exitErr) {
+		log.Err(err).Msg("failed to run iperf")
+		return iperfCommandOutput{}
+	}
+
+	var report iperfCommandOutput
+	if err := json.Unmarshal(output, &report); err != nil {
+		log.Err(err).Msg("failed to parse iperf output")
+		return iperfCommandOutput{}
+	}
+
+	return report
 }
