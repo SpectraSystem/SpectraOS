@@ -1,1 +1,7 @@
-/var/folders/15/5nqgf_n51czb2vfntylx44tw4mppxx/T/repo_cache/3db922792cd2c781a513b059ba70346e
+package pkg
+
+//go:generate zbusc -module zui -version 0.0.1 -name zui -package stubs github.com/threefoldtech/zos/pkg+ZUI stubs/zui_stub.go
+
+type ZUI interface {
+	PushErrors(label string, errors []string) error
+}
