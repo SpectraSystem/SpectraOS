@@ -79,6 +79,7 @@ import (
 	"github.com/threefoldtech/tfgrid-sdk-go/rmb-sdk-go"
 	"github.com/threefoldtech/zos/pkg"
 	"github.com/threefoldtech/zos/pkg/capacity/dmi"
+	"github.com/threefoldtech/zos/pkg/diagnostics"
 	"github.com/threefoldtech/zos/pkg/gridtypes"
 )
 
@@ -143,6 +144,14 @@ func (n *NodeClient) DeploymentGet(ctx context.Context, contractID uint64) (dl g
 	}
 
 	return dl, nil
+}
+
+// DeploymentList gets all deployments for a twin
+func (n *NodeClient) DeploymentList(ctx context.Context) (dls []gridtypes.Deployment, err error) {
+	const cmd = "zos.deployment.list"
+
+	err = n.bus.Call(ctx, n.nodeTwin, cmd, nil, &dls)
+	return
 }
 
 // DeploymentGet gets a deployment via contract ID
@@ -289,6 +298,21 @@ func (n *NodeClient) NetworkListPublicIPs(ctx context.Context) ([]string, error)
 	return result, nil
 }
 
+// NetworkListPrivateIPs list private ips reserved for a network
+func (n *NodeClient) NetworkListPrivateIPs(ctx context.Context, networkName string) ([]string, error) {
+	const cmd = "zos.network.list_private_ips"
+	var result []string
+	in := args{
+		"network_name": networkName,
+	}
+
+	if err := n.bus.Call(ctx, n.nodeTwin, cmd, in, &result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 // NetworkGetPublicConfig returns the current public node network configuration. A node with a
 // public config can be used as an access node for wireguard.
 func (n *NodeClient) NetworkGetPublicConfig(ctx context.Context) (cfg pkg.PublicConfig, err error) {
@@ -325,5 +349,11 @@ func (n *NodeClient) SystemHypervisor(ctx context.Context) (result string, err e
 		return
 	}
 
+	return
+}
+
+func (n *NodeClient) SystemDiagnostics(ctx context.Context) (result diagnostics.Diagnostics, err error) {
+	const cmd = "zos.system.diagnostics"
+	err = n.bus.Call(ctx, n.nodeTwin, cmd, nil, &result)
 	return
 }
