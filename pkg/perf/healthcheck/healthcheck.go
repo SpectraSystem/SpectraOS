@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
+	"time"
 
+	"github.com/cenkalti/backoff"
 	"github.com/rs/zerolog/log"
 	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/perf"
@@ -20,12 +23,12 @@ const (
 // NewTask returns a new health check task.
 func NewTask() perf.Task {
 	checks := map[string]checkFunc{
+		"ntp":     ntpCheck,
 		"cache":   cacheCheck,
 		"network": networkCheck,
 	}
 	return &healthcheckTask{
 		checks: checks,
-		errors: make(map[string][]string),
 	}
 }
 
@@ -33,7 +36,6 @@ type checkFunc func(context.Context) []error
 
 type healthcheckTask struct {
 	checks map[string]checkFunc
-	errors map[string][]string
 }
 
 var _ perf.Task = (*healthcheckTask)(nil)
@@ -60,30 +62,52 @@ func (h *healthcheckTask) Description() string {
 // Run executes the health checks.
 func (h *healthcheckTask) Run(ctx context.Context) (interface{}, error) {
 	log.Debug().Msg("starting health check task")
-	for k := range h.errors {
-		// reset errors on each run
-		h.errors[k] = nil
-	}
-
-	for label, check := range h.checks {
-		errors := check(ctx)
-		if len(errors) == 0 {
-			continue
-		}
-		stringErrs := errorsToStrings(errors)
-		h.errors[label] = append(h.errors[label], stringErrs...)
-	}
+	errs := make(map[string][]string)
 
 	cl := perf.GetZbusClient(ctx)
 	zui := stubs.NewZUIStub(cl)
 
-	for label, data := range h.errors {
-		err := zui.PushErrors(ctx, label, data)
-		if err != nil {
-			return nil, err
-		}
+	var wg sync.WaitGroup
+	var mut sync.Mutex
+	for label, check := range h.checks {
+		wg.Add(1)
+
+		go func(label string, check checkFunc) {
+			defer wg.Done()
+
+			op := func() error {
+				errors := check(ctx)
+
+				mut.Lock()
+				defer mut.Unlock()
+				errs[label] = errorsToStrings(errors)
+
+				if err := zui.PushErrors(ctx, label, errs[label]); err != nil {
+					return err
+				}
+
+				if len(errors) != 0 {
+					return fmt.Errorf("failed health check")
+				}
+
+				return nil
+			}
+
+			notify := func(err error, t time.Duration) {
+				log.Error().Err(err).Str("check", label).Dur("retry-in", t).Msg("failed health check. retrying")
+			}
+
+			bo := backoff.NewExponentialBackOff()
+			bo.InitialInterval = 30 * time.Second
+			bo.MaxInterval = 30 * time.Second
+			bo.MaxElapsedTime = 10 * time.Minute
+
+			_ = backoff.RetryNotify(op, bo, notify)
+		}(label, check)
 	}
-	return h.errors, nil
+	wg.Wait()
+
+	return errs, nil
 }
 
 func errorsToStrings(errs []error) []string {
@@ -96,13 +120,13 @@ func errorsToStrings(errs []error) []string {
 
 func cacheCheck(ctx context.Context) []error {
 	var errors []error
-	if err := readonlyCheck(ctx); err != nil {
+	if err := readonlyCheck(); err != nil {
 		errors = append(errors, err)
 	}
 	return errors
 }
 
-func readonlyCheck(ctx context.Context) error {
+func readonlyCheck() error {
 	const checkFile = "/var/cache/healthcheck"
 
 	_, err := os.Create(checkFile)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/blang/semver"
@@ -74,7 +75,7 @@ func NoZosUpgrade(o bool) UpgraderOption {
 
 // Storage option overrides the default hub storage url
 // default value is hub.grid.tf
-func Storage(url string) func(u *Upgrader) error {
+func Storage(url string) UpgraderOption {
 	return func(u *Upgrader) error {
 		storage, err := storage.NewSimpleStorage(url)
 		if err != nil {
@@ -86,7 +87,7 @@ func Storage(url string) func(u *Upgrader) error {
 }
 
 // Zinit option overrides the default zinit socket
-func Zinit(socket string) func(u *Upgrader) error {
+func Zinit(socket string) UpgraderOption {
 	return func(u *Upgrader) error {
 		zinit := zinit.New(socket)
 		u.zinit = zinit
@@ -130,6 +131,7 @@ func NewUpgrader(root string, opts ...UpgraderOption) (*Upgrader, error) {
 	return u, nil
 }
 
+// Run strats the upgrader module and run the update according to the detected boot method
 func (u *Upgrader) Run(ctx context.Context) error {
 	method := u.boot.DetectBootMethod()
 	if method == BootMethodOther {
@@ -159,6 +161,8 @@ func (u *Upgrader) Run(ctx context.Context) error {
 		return nil
 	}
 
+	// if the booting method is bootstrap then we run update periodically
+	// after u.nextUpdate to make sure all the modules are always up to date
 	for {
 		err := u.update()
 		if errors.Is(err, ErrRestartNeeded) {
@@ -182,6 +186,9 @@ func (u *Upgrader) Version() semver.Version {
 	return u.boot.Version()
 }
 
+// nextUpdate returns the interval until the next update
+// which is approximately 60 minutes + jitter interval(0-10 minutes)
+// to make sure not all nodes run upgrader at the same time
 func (u *Upgrader) nextUpdate() time.Duration {
 	jitter := rand.Intn(checkJitter)
 	next := checkForUpdateEvery + (time.Duration(jitter) * time.Minute)
@@ -189,6 +196,7 @@ func (u *Upgrader) nextUpdate() time.Duration {
 	return next
 }
 
+// remote finds the `tag link` associated with the node network (for example devnet)
 func (u *Upgrader) remote() (remote hub.TagLink, err error) {
 	mode := u.boot.RunMode()
 	// find all taglinks that matches the same run mode (ex: development)
@@ -197,7 +205,6 @@ func (u *Upgrader) remote() (remote hub.TagLink, err error) {
 		hub.MatchName(mode.String()),
 		hub.MatchType(hub.TypeTagLink),
 	)
-
 	if err != nil {
 		return remote, err
 	}
@@ -240,6 +247,8 @@ func (u *Upgrader) update() error {
 	return ErrRestartNeeded
 }
 
+// updateTo updates flist packages to match "link"
+// and only update zos package if u.noZosUpgrade is set to false
 func (u *Upgrader) updateTo(link hub.TagLink) error {
 	repo, tag, err := link.Destination()
 	if err != nil {
@@ -255,7 +264,7 @@ func (u *Upgrader) updateTo(link hub.TagLink) error {
 	for _, pkg := range packages {
 		pkgRepo, name, err := pkg.Destination(repo)
 		if pkg.Name == ZosPackage {
-			// this is the last to do
+			// this is the last to do to make sure all dependencies are installed before updating zos
 			log.Debug().Str("repo", pkgRepo).Str("name", name).Msg("schedule package for later")
 			later = append(later, []string{pkgRepo, name})
 			continue
@@ -295,8 +304,8 @@ func (u *Upgrader) fileCache() string {
 }
 
 // getFlist accepts fqdn of flist as `<repo>/<name>.flist`
-func (u *Upgrader) getFlist(repo, name string) (meta.Walker, error) {
-	db, err := u.hub.Download(u.flistCache(), repo, name)
+func (u *Upgrader) getFlist(repo, name string, cache cache) (meta.Walker, error) {
+	db, err := u.hub.Download(cache.flistCache(), repo, name)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to download flist")
 	}
@@ -315,12 +324,62 @@ func (u *Upgrader) getFlist(repo, name string) (meta.Walker, error) {
 	return walker, nil
 }
 
+type cache interface {
+	flistCache() string
+	fileCache() string
+}
+
+type inMemoryCache struct {
+	file  string
+	flist string
+	root  string
+}
+
+func newInMemoryCache() (*inMemoryCache, error) {
+	root := filepath.Join("/tmp", service)
+	file := filepath.Join(root, "cache", "file")
+	flist := filepath.Join(root, "cache", "flist")
+	if err := os.MkdirAll(file, 0755); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(flist, 0755); err != nil {
+		return nil, err
+	}
+	return &inMemoryCache{file: file, flist: flist, root: root}, nil
+}
+
+func (c *inMemoryCache) flistCache() string {
+	return c.flist
+}
+func (c *inMemoryCache) fileCache() string {
+	return c.file
+}
+func (c *inMemoryCache) clean() {
+	os.RemoveAll(c.root)
+}
+
 // install from a single flist.
 func (u *Upgrader) install(repo, name string) error {
 	log.Info().Str("repo", repo).Str("name", name).Msg("start installing package")
+	var cache cache = u
+	store, err := u.getFlist(repo, name, cache)
+	if errors.Is(err, syscall.EROFS) ||
+		errors.Is(err, syscall.EPERM) ||
+		errors.Is(err, syscall.EIO) {
+		// try in memory
+		inMemoryCache, err := newInMemoryCache()
+		if err != nil {
+			return fmt.Errorf("failed to create in memory cache: %w", err)
+		}
+		defer inMemoryCache.clean()
+		cache = inMemoryCache
 
-	store, err := u.getFlist(repo, name)
-	if err != nil {
+		log.Info().Msg("downloading in memory")
+		store, err = u.getFlist(repo, name, cache)
+		if err != nil {
+			return errors.Wrapf(err, "failed to process flist: %s/%s", repo, name)
+		}
+	} else if err != nil {
 		return errors.Wrapf(err, "failed to process flist: %s/%s", repo, name)
 	}
 	defer store.Close()
@@ -328,7 +387,7 @@ func (u *Upgrader) install(repo, name string) error {
 	if err := safe(func() error {
 		// copy is done in a safe closer to avoid interrupting
 		// the installation
-		return u.copyRecursive(store, "/")
+		return u.copyRecursive(store, "/", cache)
 	}); err != nil {
 		return errors.Wrapf(err, "failed to install flist: %s/%s", repo, name)
 	}
@@ -409,9 +468,8 @@ func (u *Upgrader) ensureRestarted(service ...string) error {
 	return nil
 }
 
-func (u *Upgrader) copyRecursive(store meta.Walker, destination string, skip ...string) error {
+func (u *Upgrader) copyRecursive(store meta.Walker, destination string, cache cache, skip ...string) error {
 	return store.Walk("", func(path string, info meta.Meta) error {
-
 		dest := filepath.Join(destination, path)
 		if isIn(dest, skip) {
 			if info.IsDir() {
@@ -433,9 +491,9 @@ func (u *Upgrader) copyRecursive(store meta.Walker, destination string, skip ...
 		switch stat.Type {
 		case meta.RegularType:
 			// regular file (or other types that we don't handle)
-			return u.copyFile(dest, info)
+			return u.copyFile(dest, info, cache)
 		case meta.LinkType:
-			//fmt.Println("link target", stat.LinkTarget)
+			// fmt.Println("link target", stat.LinkTarget)
 			target := stat.LinkTarget
 			if filepath.IsAbs(target) {
 				// if target is absolute, we make sure it's under destination
@@ -454,7 +512,6 @@ func (u *Upgrader) copyRecursive(store meta.Walker, destination string, skip ...
 
 		return nil
 	})
-
 }
 
 func isIn(target string, list []string) bool {
@@ -466,7 +523,7 @@ func isIn(target string, list []string) bool {
 	return false
 }
 
-func (u *Upgrader) copyFile(dst string, src meta.Meta) error {
+func (u *Upgrader) copyFile(dst string, src meta.Meta, cache cache) error {
 	log.Info().Str("source", src.Name()).Str("destination", dst).Msg("copy file")
 
 	var (
@@ -507,8 +564,8 @@ func (u *Upgrader) copyFile(dst string, src meta.Meta) error {
 	}
 	defer fDst.Close()
 
-	cache := rofs.NewCache(u.fileCache(), u.storage)
-	fSrc, err := cache.CheckAndGet(src)
+	fsCache := rofs.NewCache(cache.fileCache(), u.storage)
+	fSrc, err := fsCache.CheckAndGet(src)
 	if err != nil {
 		return err
 	}
