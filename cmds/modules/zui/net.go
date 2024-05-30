@@ -21,11 +21,11 @@ func addressRender(ctx context.Context, table *widgets.Table, client zbus.Client
 	table.RowSeparator = false
 
 	table.Rows = [][]string{
-		{"ZOS", "Not configured"},
-		{"DMZ", "Not configured"},
-		{"YGG", "Not configured"},
-		{"PUB", "Not configured"},
-		{"DUL", "Not configured"},
+		{"ZOS", loading},
+		{"DMZ", loading},
+		{"YGG", loading},
+		{"PUB", loading},
+		{"DUL", loading},
 	}
 
 	stub := stubs.NewNetworkerStub(client)
@@ -71,12 +71,11 @@ func addressRender(ctx context.Context, table *widgets.Table, client zbus.Client
 		return err
 	}
 
-	table.Rows[0][1] = toString(a[types.DefaultBridge].IPs)
+	table.Rows[0][1] = toString(a.Interfaces[types.DefaultBridge].IPs)
 
 	go func() {
 		for {
 			render.Signal()
-
 			table.ColumnWidths = []int{6, table.Size().X - 9}
 			select {
 			case a := <-zos:
