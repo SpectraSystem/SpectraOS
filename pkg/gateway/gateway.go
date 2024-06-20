@@ -348,7 +348,7 @@ func (g *gatewayModule) validateNameContracts() error {
 	baseDomain := cfg.Domain
 	if baseDomain == "" {
 		// domain doesn't exist so no name workloads exist
-		// or the domain was unset and name wokrloads will never be deleted
+		// or the domain was unset and name workloads will never be deleted
 		// should iterate over workloads instead?
 		return nil
 	}
@@ -541,7 +541,7 @@ func (g *gatewayModule) validateNameContract(name string, twinID uint32) error {
 	}
 	contract, subErr := g.substrateGateway.GetContract(context.Background(), contractID)
 	if subErr.IsCode(pkg.CodeNotFound) {
-		return fmt.Errorf("contract by name returned %d, but retreiving it results in 'not found' error", contractID)
+		return fmt.Errorf("contract by name returned %d, but retrieving it results in 'not found' error", contractID)
 	} else if subErr.IsError() {
 		return subErr.Err
 	}
@@ -573,6 +573,7 @@ func (g *gatewayModule) SetNamedProxy(wlID string, config zos.GatewayNameProxy) 
 	if cfg.Domain == "" {
 		return "", errors.New("node doesn't support name proxy (doesn't have a domain)")
 	}
+
 	if err := g.validateNameContract(config.Name, twinID); err != nil {
 		return "", errors.Wrap(err, "failed to verify name contract")
 	}
