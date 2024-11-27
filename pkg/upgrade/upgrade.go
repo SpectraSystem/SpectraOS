@@ -20,9 +20,10 @@ import (
 	"github.com/threefoldtech/0-fs/meta"
 	"github.com/threefoldtech/0-fs/rofs"
 	"github.com/threefoldtech/0-fs/storage"
-	substrate "github.com/threefoldtech/tfchain/clients/tfchain-client-go"
+	"github.com/threefoldtech/zbus"
 	"github.com/threefoldtech/zos/pkg/app"
 	"github.com/threefoldtech/zos/pkg/environment"
+	"github.com/threefoldtech/zos/pkg/stubs"
 	"github.com/threefoldtech/zos/pkg/upgrade/hub"
 	"github.com/threefoldtech/zos/pkg/zinit"
 
@@ -56,20 +57,13 @@ type ChainVersion struct {
 	Version       string `json:"version"`
 }
 
-func getRolloutConfig(env environment.Environment) (ChainVersion, []uint32, error) {
+func getRolloutConfig(ctx context.Context, gw *stubs.SubstrateGatewayStub) (ChainVersion, []uint32, error) {
 	config, err := environment.GetConfig()
 	if err != nil {
 		return ChainVersion{}, nil, errors.Wrap(err, "failed to get network config")
 	}
 
-	manager := substrate.NewManager(env.SubstrateURL...)
-
-	con, err := manager.Substrate()
-	if err != nil {
-		return ChainVersion{}, nil, err
-	}
-
-	v, err := con.GetZosVersion()
+	v, err := gw.GetZosVersion(ctx)
 	if err != nil {
 		return ChainVersion{}, nil, errors.Wrap(err, "failed to get zos version from chain")
 	}
@@ -92,6 +86,7 @@ func getRolloutConfig(env environment.Environment) (ChainVersion, []uint32, erro
 type Upgrader struct {
 	boot         Boot
 	zinit        *zinit.Client
+	zcl          zbus.Client
 	root         string
 	noZosUpgrade bool
 	hub          *hub.HubClient
@@ -107,6 +102,15 @@ type UpgraderOption func(u *Upgrader) error
 func NoZosUpgrade(o bool) UpgraderOption {
 	return func(u *Upgrader) error {
 		u.noZosUpgrade = o
+
+		return nil
+	}
+}
+
+// ZbusClient option, adds a zbus client to the upgrader
+func ZbusClient(cl zbus.Client) UpgraderOption {
+	return func(u *Upgrader) error {
+		u.zcl = cl
 
 		return nil
 	}
@@ -203,7 +207,7 @@ func (u *Upgrader) Run(ctx context.Context) error {
 	// if the booting method is bootstrap then we run update periodically
 	// after u.nextUpdate to make sure all the modules are always up to date
 	for {
-		err := u.update()
+		err := u.update(ctx)
 		if errors.Is(err, ErrRestartNeeded) {
 			return err
 		} else if err != nil {
@@ -231,7 +235,7 @@ func (u *Upgrader) Version() semver.Version {
 func (u *Upgrader) nextUpdate() time.Duration {
 	jitter := rand.Intn(checkJitter)
 	next := checkForUpdateEvery + (time.Duration(jitter) * time.Minute)
-	log.Info().Str("after", next.String()).Msg("checking for update after")
+	log.Info().Str("after", next.String()).Msg("checking for update")
 	return next
 }
 
@@ -255,7 +259,7 @@ func (u *Upgrader) remote() (remote hub.TagLink, err error) {
 	return hub.NewTagLink(matches[0]), nil
 }
 
-func (u *Upgrader) update() error {
+func (u *Upgrader) update(ctx context.Context) error {
 	// here we need to do a normal full update cycle
 	current, err := u.boot.Current()
 	if err != nil {
@@ -275,7 +279,8 @@ func (u *Upgrader) update() error {
 	}
 
 	env := environment.MustGet()
-	chainVer, testFarms, err := getRolloutConfig(env)
+	gw := stubs.NewSubstrateGatewayStub(u.zcl)
+	chainVer, testFarms, err := getRolloutConfig(ctx, gw)
 	if err != nil {
 		return errors.Wrap(err, "failed to get rollout config and version")
 	}
@@ -295,7 +300,7 @@ func (u *Upgrader) update() error {
 		}
 	}
 
-	log.Info().Str("version", filepath.Base(remote.Target)).Msg("updating system...")
+	log.Info().Str("running version", u.Version().String()).Str("updating to version", filepath.Base(remote.Target)).Msg("updating system...")
 	if err := u.updateTo(remote, &current); err != nil {
 		return errors.Wrapf(err, "failed to update to new tag '%s'", remote.Target)
 	}
@@ -436,9 +441,11 @@ func newInMemoryCache() (*inMemoryCache, error) {
 func (c *inMemoryCache) flistCache() string {
 	return c.flist
 }
+
 func (c *inMemoryCache) fileCache() string {
 	return c.file
 }
+
 func (c *inMemoryCache) clean() {
 	os.RemoveAll(c.root)
 }
