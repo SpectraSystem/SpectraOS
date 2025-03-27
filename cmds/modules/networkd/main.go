@@ -68,6 +68,10 @@ func action(cli *cli.Context) error {
 		return errors.Wrap(err, "failed to migrate older dhcp service")
 	}
 
+	if err := network.CleanupUnusedLinks(); err != nil {
+		return errors.Wrap(err, "failed to cleanupUnusedLinks")
+	}
+
 	if err := bootstrap.DefaultBridgeValid(); err != nil {
 		return errors.Wrap(err, "invalid setup")
 	}
@@ -133,6 +137,10 @@ func action(cli *cli.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "error creating network manager")
 	}
+
+	// if err := nft.DropTrafficToLAN(dmz.Namespace()); err != nil {
+	// 	return errors.Wrap(err, "failed to drop traffic to lan")
+	// }
 
 	log.Info().Msg("start zbus server")
 	if err := startZBusServer(ctx, broker, networker); err != nil {
