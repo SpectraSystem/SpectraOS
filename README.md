@@ -3,7 +3,7 @@
 **Version:** v1.0.0  
 **Ticker:**  $SPECTRA
 
-**CA:** SOON
+**CA:** `524CTstkmWdmPz4B27VozNXicoRtaAZTpLnthMVgpump`
 
 ---
 
